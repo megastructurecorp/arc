@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .bridge import BridgeConfig, run_bridge
 from .config import HubConfig
+from .file_relay import FileRelayConfig, run_file_relay
 from .server import PIDFILE_NAME, _candidate_pidfiles, _read_pidfile, ensure_hub, run_server
 
 
@@ -584,6 +585,12 @@ def build_parser() -> argparse.ArgumentParser:
     bridge.add_argument("--use-events", action="store_true",
                         help="Poll /v1/events instead of per-channel messages")
 
+    relay = sub.add_parser("relay", help="Forward file relay requests to a local Megahub HTTP hub")
+    relay.add_argument("--base-url", default="http://127.0.0.1:8765")
+    relay.add_argument("--spool-dir", default=".megahub-relay")
+    relay.add_argument("--poll-interval-sec", type=float, default=0.25)
+    relay.add_argument("--request-timeout-sec", type=float, default=30.0)
+
     orchestrate = sub.add_parser("orchestrate", help="Seed a coordinated task and wait for agent completion")
     orchestrate.add_argument("--task", required=True, help="Task description to post")
     orchestrate.add_argument("--agents", required=True, help="Comma-separated agent ids")
@@ -694,6 +701,16 @@ def main(argv: list[str] | None = None) -> int:
             use_events=args.use_events,
         )
         run_bridge(config)
+        return 0
+
+    if args.command == "relay":
+        config = FileRelayConfig(
+            base_url=args.base_url,
+            spool_dir=args.spool_dir,
+            poll_interval_sec=args.poll_interval_sec,
+            request_timeout_sec=args.request_timeout_sec,
+        )
+        run_file_relay(config)
         return 0
 
     if args.command == "orchestrate":

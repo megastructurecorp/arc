@@ -19,6 +19,7 @@ Megahub gives multiple AI agents (or any software agents) a lightweight way to c
 - **Thread-scoped workflows** — group tasks, artifacts, and status updates
 - **Polling-based** — agents poll with `since_id` for new messages (simple, reliable)
 - **Persistent bridges** — long-lived agent connections with handler plugins
+- **Sandbox relay mode** — file-based shim for agents that can write workspace files but cannot reach host localhost or use SQLite safely
 - **Round-robin coordination** — built-in deterministic multi-agent turn-taking
 - **Six message kinds** — `task`, `claim`, `artifact`, `release`, `notice`, `chat`
 - **Attachment support** — inline `text`/`json`/`code` and reference `file_ref`/`diff_ref`
@@ -71,7 +72,7 @@ megahub messages --thread-id task-001
 
 ## Deployment Modes
 
-Megahub supports two first-class deployment modes. Both use the same protocol, the same CLI, and the same SQLite storage — they differ only in how hub processes relate to the database file.
+Megahub supports three practical deployment modes. All keep the same hub protocol and SQLite-backed coordination state; they differ only in how agents reach the hub.
 
 ### Mode 1: Single Hub (default)
 
@@ -124,6 +125,35 @@ megahub serve --port 9876 --storage /shared/mount/megahub.sqlite3
 - The shared filesystem must support POSIX file locking (most local and NFS v3+ mounts do; some FUSE-based mounts may not)
 - Use `megahub status` to verify all hubs report the same storage path
 - Each hub has its own `X-Megahub-Instance` header so agents can tell which hub they're connected to
+
+### Mode 3: Sandbox Relay
+
+Some sandboxes can write ordinary files into the shared workspace, but they cannot:
+
+- reach the host's `127.0.0.1`
+- safely use SQLite locking on the mounted filesystem
+
+For those cases, run a tiny relay process on the host. Sandboxed agents write request files into a shared spool directory, and the host relay forwards them to the normal local Megahub HTTP API.
+
+```bash
+# Host machine:
+megahub serve
+megahub relay --spool-dir .megahub-relay
+
+# Sandboxed agent:
+MEGAHUB_TRANSPORT=relay
+MEGAHUB_RELAY_DIR=.megahub-relay
+MEGAHUB_AGENT_ID=sandbox-agent
+py _hub.py GET /v1/channels
+```
+
+**When to use this mode:**
+
+- The sandbox can read/write workspace files
+- The sandbox cannot reach the host's localhost HTTP port
+- The mounted filesystem does not support SQLite locking/WAL reliably
+
+**Why this stays small:** the hub itself is unchanged. Relay mode is just a compatibility shim that translates files into ordinary Megahub HTTP requests.
 
 **Verifying it works:**
 
@@ -241,9 +271,38 @@ with MegahubClient("http://127.0.0.1:8765") as client:
 | `megahub refresh-lock`        | Extend TTL of a held file lock                    |
 | `megahub claims`              | List claims                                       |
 | `megahub bridge`              | Run a persistent polling bridge                   |
+| `megahub relay`               | Forward file relay requests to the local hub      |
 
 
 All commands accept `--base-url` (default `http://127.0.0.1:8765`).
+
+### Relay options
+
+```
+megahub relay [--base-url URL] [--spool-dir PATH]
+              [--poll-interval-sec SEC] [--request-timeout-sec SEC]
+```
+
+This command is meant to run on the host machine. It watches the spool directory for request files from sandboxed agents and forwards them to the normal Megahub HTTP API.
+
+### `_hub.py` helper modes
+
+The repo includes a tiny helper script for agent prompts:
+
+```bash
+py _hub.py GET /v1/channels
+py _hub.py POST /v1/messages body.json
+```
+
+By default `_hub.py` uses direct HTTP mode. For sandbox relay mode, set:
+
+```bash
+MEGAHUB_TRANSPORT=relay
+MEGAHUB_RELAY_DIR=.megahub-relay
+MEGAHUB_AGENT_ID=my-agent
+```
+
+Then `_hub.py` writes request files into the relay spool directory and waits for the host relay to write a response file back.
 
 ### Serve options
 
