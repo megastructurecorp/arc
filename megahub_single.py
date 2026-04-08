@@ -18,7 +18,7 @@ Shared-filesystem example (two sandboxed agents):
   # Sandbox B:  python megahub_single.py --port 9876 --storage /shared/megahub.sqlite3
 """
 from __future__ import annotations
-import argparse, hashlib, json, os, re, sqlite3, tempfile, threading, uuid
+import argparse, hashlib, json, os, re, sqlite3, tempfile, threading, time, uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -973,6 +973,27 @@ def _parse_limit(q, max_limit):
     return min(limit, max_limit)
 
 
+def _parse_timeout(q):
+    raw = q.get("timeout", ["0"])[0]
+    try:
+        t = float(raw)
+    except ValueError as e:
+        raise ValueError("timeout must be a number") from e
+    return max(0.0, min(t, 60.0))
+
+def _poll_until(fetch_fn, timeout, interval=0.25):
+    """Call fetch_fn() repeatedly until it returns non-empty or timeout expires."""
+    if timeout <= 0:
+        return fetch_fn()
+    deadline = time.monotonic() + timeout
+    while True:
+        rows = fetch_fn()
+        if rows:
+            return rows
+        if time.monotonic() >= deadline:
+            return rows
+        time.sleep(interval)
+
 def _parse_since_id(q):
     raw = q.get("since_id", ["0"])[0]
     try:
@@ -1054,8 +1075,9 @@ class _H(BaseHTTPRequestHandler):
             try:
                 si = _parse_since_id(q)
                 li = _parse_limit(q, cfg.max_query_limit)
+                to = _parse_timeout(q)
             except ValueError as e: return self._err(str(e))
-            msgs = s.list_visible_messages_for_agent(aid, since_id=si, limit=li, channel=ch, thread_id=tid)
+            msgs = _poll_until(lambda: s.list_visible_messages_for_agent(aid, since_id=si, limit=li, channel=ch, thread_id=tid), to)
             return self._ok({"ok":True,"result":msgs})
         if _P["messages"].match(path):
             ch, tid = q.get("channel",[None])[0], q.get("thread_id",[None])[0]
@@ -1064,8 +1086,9 @@ class _H(BaseHTTPRequestHandler):
             try:
                 si = _parse_since_id(q)
                 li = _parse_limit(q, cfg.max_query_limit)
+                to = _parse_timeout(q)
             except ValueError as e: return self._err(str(e))
-            msgs = s.list_thread_messages(tid,channel=ch,since_id=si,limit=li) if tid else s.list_channel_messages(ch,since_id=si,limit=li)
+            msgs = _poll_until(lambda: s.list_thread_messages(tid,channel=ch,since_id=si,limit=li) if tid else s.list_channel_messages(ch,since_id=si,limit=li), to)
             return self._ok({"ok":True,"result":msgs})
         if _P["threads"].match(path):
             return self._ok({"ok":True,"result":s.list_threads()})
