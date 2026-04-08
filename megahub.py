@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Megahub — single-file local-first agent coordination hub.
 
-    python megahub_single.py [--port 8765] [--storage megahub.sqlite3]
+    python megahub.py [--port 8765] [--storage megahub.sqlite3]
 
 Zero dependencies beyond Python 3.10+. Provides 12 REST endpoints for
 multi-agent coordination via HTTP + SQLite.
@@ -12,10 +12,13 @@ Deployment modes:
      machines, all pointing --storage at the SAME SQLite file on a
      shared/mounted filesystem. SQLite WAL mode handles concurrent
      access. Messages, claims, and locks are visible across all hubs.
+  3. Sandbox relay: a host-side relay forwards file-spooled requests
+     for sandboxes that can write workspace files but cannot reach
+     host localhost or safely use SQLite on the shared mount.
 
 Shared-filesystem example (two sandboxed agents):
-  # Sandbox A:  python megahub_single.py --port 8765 --storage /shared/megahub.sqlite3
-  # Sandbox B:  python megahub_single.py --port 9876 --storage /shared/megahub.sqlite3
+  # Sandbox A:  python megahub.py --port 8765 --storage /shared/megahub.sqlite3
+  # Sandbox B:  python megahub.py --port 9876 --storage /shared/megahub.sqlite3
 """
 from __future__ import annotations
 import argparse, hashlib, json, os, re, sqlite3, tempfile, threading, time, uuid
@@ -25,10 +28,18 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Any
+import urllib.error
+import urllib.parse
+import urllib.request
 from urllib.parse import parse_qs, urlparse
 
 __version__ = "0.1.0"
 LOCAL_BIND_HOSTS = {"127.0.0.1", "localhost", "::1"}
+DEFAULT_SPOOL_DIR = ".megahub-relay"
+DEFAULT_BASE_URL = "http://127.0.0.1:8765"
+DEFAULT_CHANNEL = "smoke-room"
+DEFAULT_THREAD_ID = "smoke-relay-001"
+DEFAULT_CLAIM_KEY = "smoke-claim-001"
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
@@ -1482,6 +1493,482 @@ def ensure_hub(host="127.0.0.1", port=8765, storage="megahub.sqlite3", timeout=5
         if _probe(base): return {"running": True, "started": True, "url": base}
     return {"running": False, "started": True, "url": base, "error": "timeout"}
 
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _safe_agent_id(agent_id: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(agent_id or "").strip())
+    return cleaned or "agent"
+
+
+def _spool_root(spool_dir: str | Path) -> Path:
+    # Keep spool paths lexical instead of calling resolve(). Some sandbox
+    # harnesses expose the workspace through odd mount paths, and resolve()
+    # can turn a simple relative path into an unusable host-looking string.
+    path = Path(spool_dir).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
+def _requests_root(spool_dir: str | Path) -> Path:
+    return _spool_root(spool_dir) / "requests"
+
+
+def _responses_root(spool_dir: str | Path) -> Path:
+    return _spool_root(spool_dir) / "responses"
+
+
+def _agent_requests_dir(spool_dir: str | Path, agent_id: str) -> Path:
+    return _requests_root(spool_dir) / _safe_agent_id(agent_id)
+
+
+def _agent_responses_dir(spool_dir: str | Path, agent_id: str) -> Path:
+    return _responses_root(spool_dir) / _safe_agent_id(agent_id)
+
+
+def ensure_spool_dirs(spool_dir: str | Path, *, agent_id: str | None = None) -> Path:
+    root = _spool_root(spool_dir)
+    _requests_root(root).mkdir(parents=True, exist_ok=True)
+    _responses_root(root).mkdir(parents=True, exist_ok=True)
+    if agent_id is not None:
+        _agent_requests_dir(root, agent_id).mkdir(parents=True, exist_ok=True)
+        _agent_responses_dir(root, agent_id).mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _load_json_file(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _error_response(request_id: str, status: int, error: str, *, body: Any = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "request_id": request_id,
+        "ok": False,
+        "status": status,
+        "completed_at": _iso_now(),
+        "error": error,
+    }
+    if body is not None:
+        payload["body"] = body
+    return payload
+
+
+def _validate_request_envelope(payload: Any, *, fallback_request_id: str, fallback_agent_id: str) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("request envelope must be a JSON object")
+    request_id = str(payload.get("request_id") or fallback_request_id).strip() or fallback_request_id
+    agent_id = str(payload.get("agent_id") or fallback_agent_id).strip() or fallback_agent_id
+    method = str(payload.get("method") or "").upper()
+    path = str(payload.get("path") or "")
+    body = payload.get("body")
+    if not method:
+        raise ValueError("request envelope missing method")
+    if not path.startswith("/"):
+        raise ValueError("request path must start with '/'")
+    if body is not None and not isinstance(body, dict):
+        raise ValueError("request body must be a JSON object when provided")
+    return {
+        "request_id": request_id,
+        "agent_id": agent_id,
+        "method": method,
+        "path": path,
+        "body": body,
+        "created_at": payload.get("created_at") or _iso_now(),
+    }
+
+
+def _forward_http(base_url: str, method: str, path: str, body: dict[str, Any] | None, timeout: float) -> tuple[int, Any]:
+    url = f"{base_url.rstrip('/')}{path}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            status = getattr(response, "status", 200)
+            raw = response.read().decode("utf-8")
+            try:
+                return status, json.loads(raw)
+            except json.JSONDecodeError:
+                return status, raw
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8")
+        try:
+            return exc.code, json.loads(raw)
+        except json.JSONDecodeError:
+            return exc.code, raw
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        return 599, {"ok": False, "error": f"connection error: {exc}"}
+
+
+@dataclass(slots=True)
+class FileRelayConfig:
+    base_url: str = DEFAULT_BASE_URL
+    spool_dir: str = DEFAULT_SPOOL_DIR
+    poll_interval_sec: float = 0.25
+    request_timeout_sec: float = 30.0
+
+
+class FileRelayClient:
+    def __init__(
+        self,
+        *,
+        agent_id: str,
+        spool_dir: str = DEFAULT_SPOOL_DIR,
+        timeout: float = 30.0,
+        poll_interval_sec: float = 0.1,
+    ):
+        self.agent_id = agent_id
+        self.spool_dir = spool_dir
+        self.timeout = timeout
+        self.poll_interval_sec = poll_interval_sec
+
+    def call(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        try:
+            ensure_spool_dirs(self.spool_dir, agent_id=self.agent_id)
+            request_path = _agent_requests_dir(self.spool_dir, self.agent_id) / f"{request_id}.json"
+            response_path = _agent_responses_dir(self.spool_dir, self.agent_id) / f"{request_id}.json"
+            request_payload = {
+                "request_id": request_id,
+                "agent_id": self.agent_id,
+                "method": method.upper(),
+                "path": path,
+                "body": body,
+                "created_at": _iso_now(),
+            }
+            _atomic_write_json(request_path, request_payload)
+        except OSError as exc:
+            return _error_response(request_id, 597, f"relay spool write failed: {exc}")
+
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            if response_path.exists():
+                payload = _load_json_file(response_path)
+                if not isinstance(payload, dict):
+                    return _error_response(request_id, 500, "relay produced invalid response payload", body=payload)
+                return payload
+            time.sleep(self.poll_interval_sec)
+        return _error_response(request_id, 598, "relay timed out waiting for response")
+
+
+class FileRelayServer:
+    def __init__(self, config: FileRelayConfig):
+        self.config = config
+        self._stopped = False
+
+    def request_stop(self) -> None:
+        self._stopped = True
+
+    def run(self) -> None:
+        ensure_spool_dirs(self.config.spool_dir)
+        while not self._stopped:
+            self.process_once()
+            time.sleep(self.config.poll_interval_sec)
+
+    def process_once(self) -> int:
+        processed = 0
+        for request_path in sorted(_requests_root(self.config.spool_dir).glob("*/*.json")):
+            processed += 1 if self._process_request_file(request_path) else 0
+        return processed
+
+    def _process_request_file(self, request_path: Path) -> bool:
+        work_path = request_path.with_suffix(".work")
+        try:
+            request_path.replace(work_path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+
+        agent_id = request_path.parent.name
+        request_id = request_path.stem
+        response_path = _agent_responses_dir(self.config.spool_dir, agent_id) / f"{request_id}.json"
+
+        try:
+            try:
+                raw_payload = _load_json_file(work_path)
+                payload = _validate_request_envelope(
+                    raw_payload,
+                    fallback_request_id=request_id,
+                    fallback_agent_id=agent_id,
+                )
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                _atomic_write_json(response_path, _error_response(request_id, 400, f"invalid relay request: {exc}"))
+                return True
+
+            status, body = _forward_http(
+                self.config.base_url,
+                payload["method"],
+                payload["path"],
+                payload["body"],
+                self.config.request_timeout_sec,
+            )
+            ok = False
+            error: str | None = None
+            if isinstance(body, dict):
+                ok = bool(body.get("ok", False))
+                error = body.get("error") if isinstance(body.get("error"), str) else None
+            elif 200 <= status < 300:
+                ok = True
+            else:
+                error = str(body)
+
+            response_payload: dict[str, Any] = {
+                "request_id": payload["request_id"],
+                "ok": ok,
+                "status": status,
+                "body": body,
+                "completed_at": _iso_now(),
+            }
+            if error:
+                response_payload["error"] = error
+            _atomic_write_json(response_path, response_payload)
+            return True
+        finally:
+            # Keep processed .work files on disk. Some sandbox mounts refuse
+            # deletes even when reads and renames succeed. The relay spool is
+            # intentionally append-only; callers can clean it explicitly later.
+            pass
+
+
+def run_file_relay(config: FileRelayConfig) -> None:
+    FileRelayServer(config).run()
+
+
+class SmokeError(RuntimeError):
+    pass
+
+
+def _http_json(base_url: str, method: str, path: str, payload: dict[str, Any] | None = None, *, timeout: float = 15.0) -> dict[str, Any]:
+    url = f"{base_url.rstrip('/')}{path}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8")
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            return {"ok": False, "error": body, "status": exc.code}
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        return {"ok": False, "error": f"connection error: {exc}"}
+
+
+@dataclass(slots=True)
+class SmokeTransport:
+    transport: str
+    agent_id: str
+    base_url: str = DEFAULT_BASE_URL
+    relay_dir: str = DEFAULT_SPOOL_DIR
+    timeout: float = 15.0
+
+    def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        if self.transport == "relay":
+            client = FileRelayClient(
+                agent_id=self.agent_id,
+                spool_dir=self.relay_dir,
+                timeout=self.timeout,
+            )
+            response = client.call(method, path, payload)
+            body = response.get("body")
+            if isinstance(body, dict):
+                return body
+            if response.get("ok"):
+                return {"ok": True, "result": body}
+            return {"ok": False, "error": response.get("error") or str(body)}
+        return _http_json(self.base_url, method, path, payload, timeout=self.timeout)
+
+
+def _require_ok(resp: dict[str, Any], action: str) -> dict[str, Any]:
+    if not resp.get("ok"):
+        raise SmokeError(f"{action} failed: {resp.get('error', 'unknown error')}")
+    return resp
+
+
+def _messages_path(channel: str, thread_id: str, since_id: int = 0) -> str:
+    query = urllib.parse.urlencode({"channel": channel, "thread_id": thread_id, "since_id": str(since_id)})
+    return f"/v1/messages?{query}"
+
+
+def _wait_for_messages(
+    transport: SmokeTransport,
+    *,
+    channel: str,
+    thread_id: str,
+    predicate,
+    timeout_sec: float,
+    poll_interval_sec: float,
+) -> list[dict[str, Any]]:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        resp = transport.request("GET", _messages_path(channel, thread_id))
+        if resp.get("ok"):
+            messages = resp.get("result", [])
+            if predicate(messages):
+                return messages
+        time.sleep(poll_interval_sec)
+    raise SmokeError(f"timed out waiting for messages on thread {thread_id}")
+
+
+def _contains_from(messages: list[dict[str, Any]], agent_id: str, *, kind: str | None = None, body_contains: str | None = None) -> bool:
+    for item in messages:
+        if item.get("from_agent") != agent_id:
+            continue
+        if kind is not None and item.get("kind") != kind:
+            continue
+        if body_contains is not None and body_contains not in str(item.get("body", "")):
+            continue
+        return True
+    return False
+
+
+def run_smoke_agent(
+    *,
+    role: str,
+    transport_name: str,
+    base_url: str = DEFAULT_BASE_URL,
+    relay_dir: str = DEFAULT_SPOOL_DIR,
+    channel: str = DEFAULT_CHANNEL,
+    thread_id: str = DEFAULT_THREAD_ID,
+    claim_key: str = DEFAULT_CLAIM_KEY,
+    timeout_sec: float = 120.0,
+    poll_interval_sec: float = 1.0,
+) -> int:
+    if role not in {"smoke-a", "smoke-b", "smoke-c"}:
+        raise SmokeError(f"unknown role: {role}")
+    transport = SmokeTransport(
+        transport=transport_name,
+        agent_id=role,
+        base_url=base_url,
+        relay_dir=relay_dir,
+        timeout=max(5.0, min(timeout_sec, 30.0)),
+    )
+
+    _require_ok(transport.request("POST", "/v1/sessions", {
+        "agent_id": role,
+        "display_name": role,
+        "replace": True,
+    }), "open session")
+
+    if role == "smoke-a":
+        _require_ok(transport.request("POST", "/v1/channels", {
+            "name": channel,
+            "created_by": role,
+        }), "create channel")
+        _require_ok(transport.request("POST", "/v1/messages", {
+            "from_agent": role,
+            "channel": channel,
+            "kind": "task",
+            "body": "smoke task from smoke-a",
+            "thread_id": thread_id,
+        }), "post task")
+        _wait_for_messages(
+            transport,
+            channel=channel,
+            thread_id=thread_id,
+            predicate=lambda messages: _contains_from(messages, "smoke-b", kind="artifact")
+            and _contains_from(messages, "smoke-c", kind="notice", body_contains="verified"),
+            timeout_sec=timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+        )
+        _require_ok(transport.request("POST", "/v1/messages", {
+            "from_agent": role,
+            "channel": channel,
+            "kind": "notice",
+            "body": "smoke-a saw both agents and the smoke test passed from the host side",
+            "thread_id": thread_id,
+        }), "post final notice")
+        return 0
+
+    if role == "smoke-b":
+        _wait_for_messages(
+            transport,
+            channel=channel,
+            thread_id=thread_id,
+            predicate=lambda messages: _contains_from(messages, "smoke-a", kind="task"),
+            timeout_sec=timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+        )
+        claim_resp = _require_ok(transport.request("POST", "/v1/claims", {
+            "claim_key": claim_key,
+            "owner_agent_id": role,
+            "thread_id": thread_id,
+        }), "acquire claim")
+        if not claim_resp.get("acquired", False):
+            raise SmokeError(f"claim denied to {role}")
+        _require_ok(transport.request("POST", "/v1/messages", {
+            "from_agent": role,
+            "channel": channel,
+            "kind": "artifact",
+            "body": "smoke-b reached the hub through relay mode",
+            "thread_id": thread_id,
+        }), "post artifact")
+        _require_ok(transport.request("POST", "/v1/claims/release", {
+            "claim_key": claim_key,
+            "agent_id": role,
+        }), "release claim")
+        _wait_for_messages(
+            transport,
+            channel=channel,
+            thread_id=thread_id,
+            predicate=lambda messages: _contains_from(messages, "smoke-c", kind="notice", body_contains="verified"),
+            timeout_sec=timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+        )
+        _require_ok(transport.request("POST", "/v1/messages", {
+            "from_agent": role,
+            "channel": channel,
+            "kind": "notice",
+            "body": "smoke-b confirms relay interop works",
+            "thread_id": thread_id,
+        }), "post confirmation notice")
+        return 0
+
+    _wait_for_messages(
+        transport,
+        channel=channel,
+        thread_id=thread_id,
+        predicate=lambda messages: _contains_from(messages, "smoke-a", kind="task")
+        and _contains_from(messages, "smoke-b", kind="artifact"),
+        timeout_sec=timeout_sec,
+        poll_interval_sec=poll_interval_sec,
+    )
+    claims_resp = _require_ok(
+        transport.request(
+            "GET",
+            f"/v1/claims?{urllib.parse.urlencode({'thread_id': thread_id, 'active_only': 'true'})}",
+        ),
+        "list claims",
+    )
+    active_claims = claims_resp.get("result", [])
+    claim_state = "released"
+    if active_claims:
+        for claim in active_claims:
+            if claim.get("claim_key") == claim_key:
+                claim_state = f"held by {claim.get('owner_agent_id')}"
+                break
+    _require_ok(transport.request("POST", "/v1/messages", {
+        "from_agent": role,
+        "channel": channel,
+        "kind": "notice",
+        "body": f"smoke-c verified shared visibility across direct HTTP and relay mode ({claim_state})",
+        "thread_id": thread_id,
+    }), "post verifier notice")
+    return 0
+
 def main():
     ap = argparse.ArgumentParser(description="Megahub — single-file agent coordination hub")
     sub = ap.add_subparsers(dest="command")
@@ -1507,6 +1994,85 @@ def main():
         run_server(cfg)
     except KeyboardInterrupt:
         pass
+
+def main():
+    ap = argparse.ArgumentParser(description="Megahub - single-file agent coordination hub")
+    sub = ap.add_subparsers(dest="command")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--storage", default="megahub.sqlite3")
+    ap.add_argument("--allow-remote", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+
+    ens = sub.add_parser("ensure", help="Start hub if not already running, then exit")
+    ens.add_argument("--host", default="127.0.0.1")
+    ens.add_argument("--port", type=int, default=8765)
+    ens.add_argument("--storage", default="megahub.sqlite3")
+    ens.add_argument("--timeout", type=float, default=5.0)
+
+    relay = sub.add_parser("relay", help="Forward file-spooled relay requests to the local hub")
+    relay.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    relay.add_argument("--spool-dir", default=DEFAULT_SPOOL_DIR)
+    relay.add_argument("--poll-interval-sec", type=float, default=0.25)
+    relay.add_argument("--request-timeout-sec", type=float, default=30.0)
+
+    smoke = sub.add_parser("smoke-agent", help="Run a deterministic smoke-test role")
+    smoke.add_argument("--role", required=True, choices=("smoke-a", "smoke-b", "smoke-c"))
+    smoke.add_argument("--transport", required=True, choices=("http", "relay"))
+    smoke.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    smoke.add_argument("--relay-dir", default=DEFAULT_SPOOL_DIR)
+    smoke.add_argument("--channel", default=DEFAULT_CHANNEL)
+    smoke.add_argument("--thread-id", default=DEFAULT_THREAD_ID)
+    smoke.add_argument("--claim-key", default=DEFAULT_CLAIM_KEY)
+    smoke.add_argument("--timeout-sec", type=float, default=120.0)
+    smoke.add_argument("--poll-interval-sec", type=float, default=1.0)
+
+    a = ap.parse_args()
+    if a.command == "ensure":
+        r = ensure_hub(host=a.host, port=a.port, storage=a.storage, timeout=a.timeout)
+        print(json.dumps(r, indent=2))
+        raise SystemExit(0 if r.get("running") else 1)
+    if a.command == "relay":
+        cfg = FileRelayConfig(
+            base_url=a.base_url,
+            spool_dir=a.spool_dir,
+            poll_interval_sec=a.poll_interval_sec,
+            request_timeout_sec=a.request_timeout_sec,
+        )
+        try:
+            run_file_relay(cfg)
+        except KeyboardInterrupt:
+            pass
+        return
+    if a.command == "smoke-agent":
+        try:
+            raise SystemExit(run_smoke_agent(
+                role=a.role,
+                transport_name=a.transport,
+                base_url=a.base_url,
+                relay_dir=a.relay_dir,
+                channel=a.channel,
+                thread_id=a.thread_id,
+                claim_key=a.claim_key,
+                timeout_sec=a.timeout_sec,
+                poll_interval_sec=a.poll_interval_sec,
+            ))
+        except SmokeError as exc:
+            print(f"Smoke test failed: {exc}")
+            raise SystemExit(1)
+
+    cfg = HubConfig(
+        listen_host=a.host,
+        port=a.port,
+        storage_path=a.storage,
+        allow_remote=a.allow_remote,
+        log_events=not a.quiet,
+    )
+    try:
+        run_server(cfg)
+    except KeyboardInterrupt:
+        pass
+
 
 if __name__ == "__main__":
     main()
