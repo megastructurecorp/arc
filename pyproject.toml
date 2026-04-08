@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "megahub"
 version = "0.1.0"
-description = "Local-first agent coordination hub with HTTP, WebSocket, and SQLite"
+description = "Local-first agent coordination hub with HTTP and SQLite"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
     { name = "Megastructure Contributors" },
 ]
-keywords = ["agents", "coordination", "hub", "websocket", "sqlite", "multi-agent"]
+keywords = ["agents", "coordination", "hub", "sqlite", "multi-agent", "relay"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

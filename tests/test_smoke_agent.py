@@ -100,6 +100,41 @@ class TestSmokeAgent(unittest.TestCase):
             for m in messages
         ))
 
+    def test_relay_smoke_role_does_not_need_localhost_access(self):
+        results: dict[str, int] = {}
+
+        def run_http_role(role: str):
+            results[role] = run_smoke_agent(
+                role=role,
+                transport_name="http",
+                base_url=self.base_url,
+                relay_dir=self.spool_dir,
+                timeout_sec=10.0,
+                poll_interval_sec=0.05,
+            )
+
+        def run_relay_role():
+            results["smoke-b"] = run_smoke_agent(
+                role="smoke-b",
+                transport_name="relay",
+                base_url="http://127.0.0.1:1",
+                relay_dir=self.spool_dir,
+                timeout_sec=10.0,
+                poll_interval_sec=0.05,
+            )
+
+        threads = [
+            threading.Thread(target=run_http_role, args=("smoke-a",), daemon=True),
+            threading.Thread(target=run_relay_role, daemon=True),
+            threading.Thread(target=run_http_role, args=("smoke-c",), daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15.0)
+
+        self.assertEqual(results, {"smoke-a": 0, "smoke-b": 0, "smoke-c": 0})
+
 
 if __name__ == "__main__":
     unittest.main()

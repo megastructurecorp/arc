@@ -11,7 +11,6 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .bridge import BridgeConfig, run_bridge
 from .config import HubConfig
 from .file_relay import FileRelayConfig, run_file_relay
 from .server import PIDFILE_NAME, _candidate_pidfiles, _read_pidfile, ensure_hub, run_server
@@ -556,35 +555,6 @@ def build_parser() -> argparse.ArgumentParser:
     inbox.add_argument("--since-id", type=int, default=0)
     inbox.add_argument("--limit", type=int, default=100)
 
-    bridge = sub.add_parser("bridge", help="Poll for events and run handlers")
-    bridge.add_argument("--base-url", default="http://127.0.0.1:8765")
-    bridge.add_argument("--agent-id", required=True)
-    bridge.add_argument("--display-name")
-    bridge.add_argument("--capability", action="append", default=[])
-    bridge.add_argument("--metadata", default="{}")
-    bridge.add_argument("--since-id", type=int, default=0)
-    bridge.add_argument("--channel", action="append", default=[])
-    bridge.add_argument("--thread-id", action="append", default=[])
-    bridge.add_argument("--handler-command")
-    bridge.add_argument(
-        "--builtin-handler",
-        choices=("thread-reply", "round-robin"),
-        help="Use a built-in handler instead of spawning a subprocess",
-    )
-    bridge.add_argument("--agent-name")
-    bridge.add_argument(
-        "--handler-style",
-        default="ack",
-        help="Style passed to the built-in handler (ack/review/concise)",
-    )
-    bridge.add_argument("--include-self", action="store_true")
-    bridge.add_argument("--no-replace", action="store_true")
-    bridge.add_argument("--poll-interval-sec", type=float, default=1.0)
-    bridge.add_argument("--refresh-every", type=float, default=None,
-                        help="Auto-refresh held claims and locks every N seconds")
-    bridge.add_argument("--use-events", action="store_true",
-                        help="Poll /v1/events instead of per-channel messages")
-
     relay = sub.add_parser("relay", help="Forward file relay requests to a local Megahub HTTP hub")
     relay.add_argument("--base-url", default="http://127.0.0.1:8765")
     relay.add_argument("--spool-dir", default=".megahub-relay")
@@ -678,29 +648,6 @@ def main(argv: list[str] | None = None) -> int:
             allow_remote=args.allow_remote,
         )
         run_server(config)
-        return 0
-
-    if args.command == "bridge":
-        config = BridgeConfig(
-            base_url=args.base_url,
-            agent_id=args.agent_id,
-            display_name=args.display_name,
-            capabilities=args.capability,
-            metadata=_safe_json_loads(args.metadata),
-            replace=not args.no_replace,
-            since_id=args.since_id,
-            channels=set(args.channel) or None,
-            thread_ids=set(args.thread_id) or None,
-            ignore_self=not args.include_self,
-            handler_command=args.handler_command,
-            builtin_handler=args.builtin_handler,
-            agent_name=args.agent_name,
-            handler_style=args.handler_style,
-            poll_interval_sec=args.poll_interval_sec,
-            refresh_every_sec=args.refresh_every,
-            use_events=args.use_events,
-        )
-        run_bridge(config)
         return 0
 
     if args.command == "relay":
