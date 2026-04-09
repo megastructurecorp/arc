@@ -46,334 +46,179 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Megahub Dashboard</title>
+<title>Megahub</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-  background:#0f172a;color:#e2e8f0;line-height:1.5;padding:1rem}
-h1{font-size:1.5rem;font-weight:700;color:#38bdf8;margin-bottom:.25rem}
-.subtitle{color:#64748b;font-size:.85rem;margin-bottom:1rem}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:1rem;margin-bottom:1rem}
-.card{background:#1e293b;border:1px solid #334155;border-radius:.5rem;padding:1rem;overflow:hidden}
-.card h2{font-size:1rem;font-weight:600;color:#94a3b8;margin-bottom:.75rem;
-  display:flex;align-items:center;gap:.4rem}
-.card h2 .count{background:#334155;color:#38bdf8;font-size:.75rem;
-  padding:.1rem .45rem;border-radius:9999px}
-table{width:100%;border-collapse:collapse;font-size:.82rem}
-th{text-align:left;color:#64748b;font-weight:500;padding:.35rem .5rem;
-  border-bottom:1px solid #334155;white-space:nowrap}
-td{padding:.35rem .5rem;border-bottom:1px solid #1e293b;word-break:break-all;max-width:260px;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-tr:hover td{background:#334155}
-.badge{display:inline-block;padding:.1rem .4rem;border-radius:.25rem;font-size:.7rem;font-weight:600}
-.badge-green{background:#064e3b;color:#34d399}
-.badge-yellow{background:#713f12;color:#fbbf24}
-.badge-red{background:#7f1d1d;color:#f87171}
-.badge-blue{background:#1e3a5f;color:#60a5fa}
-.badge-purple{background:#3b0764;color:#c084fc}
-.msg-body{max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.status-bar{display:flex;align-items:center;gap:.5rem;margin-bottom:1rem;
-  font-size:.78rem;color:#64748b}
-.dot{width:8px;height:8px;border-radius:50%;display:inline-block}
-.dot-green{background:#34d399}
-.dot-red{background:#f87171}
-.empty{color:#475569;font-style:italic;padding:.5rem}
-#last-update{color:#64748b}
-.full-width{grid-column:1/-1}
-.clickable{cursor:pointer}
-.clickable:hover td{background:#334155}
-.thread-row-active td{background:#1e3a5f !important}
-#thread-detail-card{display:none}
-.detail-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem;margin-bottom:1rem}
-.detail-section{background:#0f172a;border:1px solid #334155;border-radius:.375rem;padding:.75rem}
-.detail-section h3{font-size:.85rem;font-weight:600;color:#94a3b8;margin-bottom:.5rem}
-.thread-header{margin-bottom:1rem;padding-bottom:.75rem;border-bottom:1px solid #334155}
-.thread-header .thread-title{font-size:1.1rem;font-weight:600;color:#38bdf8}
-.thread-header .thread-meta{font-size:.78rem;color:#64748b;margin-top:.25rem}
-.close-btn{float:right;background:none;border:1px solid #475569;color:#94a3b8;
-  border-radius:.25rem;padding:.15rem .5rem;cursor:pointer;font-size:.75rem}
-.close-btn:hover{background:#334155;color:#e2e8f0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
+  background:#0f172a;color:#e2e8f0;display:flex;flex-direction:column;height:100vh}
+#header{flex-shrink:0;display:flex;align-items:center;gap:.75rem;padding:.6rem 1rem;
+  background:#1e293b;border-bottom:1px solid #334155}
+#header h1{font-size:1.1rem;font-weight:700;color:#38bdf8;white-space:nowrap}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
+.dot-green{background:#34d399}.dot-red{background:#f87171}
+#status-text{font-size:.75rem;color:#64748b;white-space:nowrap}
+#agents-bar{display:flex;gap:.4rem;flex-wrap:wrap;margin-left:auto}
+.agent-pill{font-size:.7rem;padding:.15rem .5rem;border-radius:9999px;
+  background:#334155;color:#e2e8f0;white-space:nowrap;display:flex;align-items:center;gap:.3rem}
+.agent-pill .dot{width:6px;height:6px}
+#feed{flex:1;overflow-y:auto;padding:.75rem 1rem;display:flex;flex-direction:column;gap:.15rem}
+.msg{font-size:.82rem;line-height:1.5;word-wrap:break-word}
+.msg-time{color:#475569;margin-right:.4rem;font-size:.75rem}
+.msg-from{font-weight:600;margin-right:.3rem}
+.msg-operator .msg-from{color:#38bdf8}
+.msg-system{color:#64748b;font-style:italic}
+.badge{display:inline-block;padding:.05rem .35rem;border-radius:.2rem;font-size:.65rem;
+  font-weight:600;margin-right:.3rem;vertical-align:middle}
+.badge-notice{background:#713f12;color:#fbbf24}
+.badge-task{background:#3b0764;color:#c084fc}
+.badge-artifact{background:#064e3b;color:#34d399}
+.badge-claim{background:#713f12;color:#fbbf24}
+.badge-release{background:#7f1d1d;color:#f87171}
+#input-bar{flex-shrink:0;display:flex;gap:.5rem;padding:.5rem 1rem;
+  background:#1e293b;border-top:1px solid #334155}
+#msg-input{flex:1;background:#0f172a;border:1px solid #334155;border-radius:.375rem;
+  color:#e2e8f0;padding:.4rem .6rem;font-size:.85rem;font-family:inherit;outline:none}
+#msg-input:focus{border-color:#38bdf8}
+#msg-input::placeholder{color:#475569}
+#send-btn{background:#1e3a5f;color:#60a5fa;border:1px solid #334155;border-radius:.375rem;
+  padding:.4rem .8rem;font-size:.82rem;cursor:pointer;font-family:inherit;white-space:nowrap}
+#send-btn:hover{background:#2d4a6f}
+#footer{flex-shrink:0;padding:.3rem 1rem;font-size:.7rem;color:#475569;
+  background:#1e293b;border-top:1px solid #334155;display:flex;gap:1rem;align-items:center}
+#footer code{color:#64748b}
+.empty{color:#475569;font-style:italic;padding:2rem;text-align:center}
 </style>
 </head>
 <body>
-<h1>Megahub Dashboard</h1>
-<div class="status-bar">
+<div id="header">
+  <h1>Megahub</h1>
   <span class="dot dot-green" id="status-dot"></span>
-  <span id="status-text">Connected</span>
-  <span>&mdash;</span>
-  <span id="last-update">loading...</span>
+  <span id="status-text">Connecting...</span>
+  <div id="agents-bar"></div>
 </div>
-<div class="grid">
-  <div class="card" id="agents-card">
-    <h2>Agents <span class="count" id="agents-count">0</span></h2>
-    <div id="agents-body"><div class="empty">Loading...</div></div>
-  </div>
-  <div class="card" id="claims-card">
-    <h2>Active Claims <span class="count" id="claims-count">0</span></h2>
-    <div id="claims-body"><div class="empty">Loading...</div></div>
-  </div>
-  <div class="card" id="locks-card">
-    <h2>Active Locks <span class="count" id="locks-count">0</span></h2>
-    <div id="locks-body"><div class="empty">Loading...</div></div>
-  </div>
-  <div class="card" id="hub-info-card">
-    <h2>Hub Info</h2>
-    <div id="hub-info-body"><div class="empty">Loading...</div></div>
-  </div>
+<div id="feed"><div class="empty">Loading messages...</div></div>
+<div id="input-bar">
+  <input id="msg-input" type="text" placeholder="Send a message to agents..." autocomplete="off">
+  <button id="send-btn">Send</button>
 </div>
-<div class="grid">
-  <div class="card full-width" id="threads-card">
-    <h2>Active Threads <span class="count" id="threads-count">0</span></h2>
-    <div id="threads-body"><div class="empty">Loading...</div></div>
-  </div>
-</div>
-<div class="grid">
-  <div class="card full-width" id="thread-detail-card">
-    <div class="thread-header">
-      <button class="close-btn" onclick="closeDetail()">Close</button>
-      <div class="thread-title" id="detail-title">Thread</div>
-      <div class="thread-meta" id="detail-meta"></div>
-    </div>
-    <div class="detail-grid">
-      <div class="detail-section" id="detail-tasks">
-        <h3>Tasks</h3>
-        <div id="detail-tasks-body"><div class="empty">None</div></div>
-      </div>
-      <div class="detail-section" id="detail-claims">
-        <h3>Active Claims</h3>
-        <div id="detail-claims-body"><div class="empty">None</div></div>
-      </div>
-      <div class="detail-section" id="detail-locks">
-        <h3>Active Locks</h3>
-        <div id="detail-locks-body"><div class="empty">None</div></div>
-      </div>
-    </div>
-    <h2>Thread Messages <span class="count" id="detail-msg-count">0</span></h2>
-    <div id="detail-messages-body" style="max-height:400px;overflow-y:auto">
-      <div class="empty">No messages</div>
-    </div>
-  </div>
+<div id="footer">
+  <span id="hub-info"></span>
+  <span style="margin-left:auto">CLI: <code>python megahub.py stop</code> &middot; <code>python megahub.py reset</code></span>
 </div>
 <script>
-const BASE='';
-let errCount=0;
-let selectedThread=null;
-let detailTimer=null;
+const NICK_COLORS=['#38bdf8','#34d399','#fbbf24','#f87171','#c084fc','#fb923c','#2dd4bf','#e879f9'];
+let lastId=0,seeded=false;
 
 function $(id){return document.getElementById(id)}
 function esc(s){if(s==null)return'';const d=document.createElement('div');d.textContent=String(s);return d.innerHTML}
-function timeFmt(iso){if(!iso)return'-';try{return new Date(iso).toLocaleTimeString()}catch(e){return iso}}
-function timeAgo(iso){
-  if(!iso)return'-';
-  try{
-    const diff=Math.floor((Date.now()-new Date(iso).getTime())/1000);
-    if(diff<0)return'just now';
-    if(diff<60)return diff+'s ago';
-    const m=Math.floor(diff/60);if(m<60)return m+'m ago';
-    const h=Math.floor(m/60);if(h<24)return h+'h ago';
-    return Math.floor(h/24)+'d ago';
-  }catch(e){return iso}
-}
-function badge(text,cls){return '<span class="badge badge-'+cls+'">'+esc(text)+'</span>'}
-function statusBadge(s){
-  const m={open:'green',waiting:'yellow',completed:'blue'};
-  return badge(s,m[s]||'blue');
-}
-function kindBadge(k){
-  const m={chat:'blue',notice:'yellow',task:'purple',artifact:'green',claim:'yellow',release:'red'};
-  return badge(k,m[k]||'blue');
+function timeFmt(iso){if(!iso)return'';try{return new Date(iso).toLocaleTimeString()}catch(e){return iso}}
+function nickColor(name){
+  let h=0;for(let i=0;i<name.length;i++)h=((h<<5)-h+name.charCodeAt(i))|0;
+  return NICK_COLORS[Math.abs(h)%NICK_COLORS.length];
 }
 
-async function fetchJSON(path){
-  const r=await fetch(BASE+path);
-  const j=await r.json();
-  return j.ok?j.result:[];
+function shouldAutoScroll(){
+  const f=$('feed');return f.scrollTop+f.clientHeight>=f.scrollHeight-60;
+}
+
+function appendMessages(msgs){
+  const f=$('feed');
+  const wasEmpty=f.querySelector('.empty');
+  if(wasEmpty)f.innerHTML='';
+  const doScroll=shouldAutoScroll();
+  for(const m of msgs){
+    const div=document.createElement('div');
+    div.className='msg';
+    const isOp=m.from_agent==='operator';
+    const isSys=m.from_agent==='system';
+    if(isOp)div.classList.add('msg-operator');
+    if(isSys)div.classList.add('msg-system');
+    let kindBadge='';
+    if(m.kind&&m.kind!=='chat'){
+      kindBadge='<span class="badge badge-'+esc(m.kind)+'">'+esc(m.kind)+'</span>';
+    }
+    const color=isOp?'#38bdf8':isSys?'#64748b':nickColor(m.from_agent);
+    div.innerHTML='<span class="msg-time">'+timeFmt(m.ts)+'</span>'
+      +'<span class="msg-from" style="color:'+color+'">'+esc(m.from_agent)+'</span>'
+      +kindBadge+esc(m.body);
+    f.appendChild(div);
+    if(m.id>lastId)lastId=m.id;
+  }
+  if(doScroll)f.scrollTop=f.scrollHeight;
 }
 
 function renderAgents(agents){
-  $('agents-count').textContent=agents.length;
-  if(!agents.length){$('agents-body').innerHTML='<div class="empty">No active agents</div>';return}
-  let h='<table><tr><th>Agent</th><th>Display</th><th>Last Seen</th><th>Session</th></tr>';
-  for(const a of agents){
-    h+='<tr><td>'+esc(a.agent_id)+'</td><td>'+esc(a.display_name)+'</td>';
-    h+='<td>'+timeFmt(a.last_seen)+'</td>';
-    h+='<td style="font-size:.7rem;color:#64748b">'+esc(a.session_id.slice(0,8))+'</td></tr>';
-  }
-  $('agents-body').innerHTML=h+'</table>';
+  const bar=$('agents-bar');
+  if(!agents.length){bar.innerHTML='';return}
+  bar.innerHTML=agents.map(a=>
+    '<span class="agent-pill"><span class="dot dot-green"></span>'+esc(a.display_name||a.agent_id)+'</span>'
+  ).join('');
 }
 
-function renderClaims(claims){
-  const active=claims.filter(c=>!c.released_at);
-  $('claims-count').textContent=active.length;
-  if(!active.length){$('claims-body').innerHTML='<div class="empty">No active claims</div>';return}
-  let h='<table><tr><th>Key</th><th>Owner</th><th>Thread</th><th>Expires</th></tr>';
-  for(const c of active){
-    h+='<tr><td>'+esc(c.claim_key)+'</td><td>'+esc(c.owner_agent_id)+'</td>';
-    h+='<td>'+esc(c.thread_id||'-')+'</td><td>'+timeFmt(c.expires_at)+'</td></tr>';
-  }
-  $('claims-body').innerHTML=h+'</table>';
-}
-
-function renderLocks(locks){
-  const active=locks.filter(l=>!l.released_at);
-  $('locks-count').textContent=active.length;
-  if(!active.length){$('locks-body').innerHTML='<div class="empty">No active locks</div>';return}
-  let h='<table><tr><th>File</th><th>Agent</th><th>Locked</th><th>Expires</th></tr>';
-  for(const l of active){
-    h+='<tr><td>'+esc(l.file_path)+'</td><td>'+esc(l.agent_id)+'</td>';
-    h+='<td>'+timeFmt(l.locked_at)+'</td><td>'+timeFmt(l.expires_at)+'</td></tr>';
-  }
-  $('locks-body').innerHTML=h+'</table>';
-}
-
-function renderThreads(threads){
-  $('threads-count').textContent=threads.length;
-  if(!threads.length){$('threads-body').innerHTML='<div class="empty">No active threads</div>';return}
-  let h='<table><tr><th>Thread</th><th>Channel</th><th>Status</th><th>Tasks</th><th>Claims</th><th>Locks</th><th>Last Activity</th></tr>';
-  for(const t of threads){
-    const active=selectedThread===t.thread_id?' thread-row-active':'';
-    h+='<tr class="clickable'+active+'" onclick="openThread(\''+esc(t.thread_id)+'\')">';
-    h+='<td>'+esc(t.thread_id)+'</td>';
-    h+='<td>'+esc(t.channel||'-')+'</td>';
-    h+='<td>'+statusBadge(t.status)+'</td>';
-    h+='<td>'+t.open_task_count+'/'+t.total_task_count+'</td>';
-    h+='<td>'+t.active_claim_count+'</td>';
-    h+='<td>'+t.active_lock_count+'</td>';
-    h+='<td>'+timeAgo(t.latest_message_ts)+'</td></tr>';
-  }
-  $('threads-body').innerHTML=h+'</table>';
-}
-
-function renderDetailTasks(tasks,messages){
-  if(!tasks.length){$('detail-tasks-body').innerHTML='<div class="empty">None</div>';return}
-  let h='<table><tr><th>ID</th><th>Status</th><th>Description</th></tr>';
-  for(const t of tasks){
-    const msg=messages.find(m=>m.id===t.task_id);
-    const body=msg?msg.body.slice(0,80):'';
-    const st=t.status==='open'?badge('open','green'):badge(t.status,'blue');
-    h+='<tr><td>#'+t.task_id+'</td><td>'+st+'</td><td class="msg-body" title="'+esc(body)+'">'+esc(body)+'</td></tr>';
-  }
-  $('detail-tasks-body').innerHTML=h+'</table>';
-}
-
-function renderDetailClaims(claims){
-  const now=Date.now();
-  const active=claims.filter(c=>!c.released_at&&new Date(c.expires_at).getTime()>=now);
-  if(!active.length){$('detail-claims-body').innerHTML='<div class="empty">None</div>';return}
-  let h='<table><tr><th>Key</th><th>Owner</th><th>Expires</th></tr>';
-  for(const c of active){
-    const mins=Math.max(0,Math.floor((new Date(c.expires_at).getTime()-now)/60000));
-    h+='<tr><td>'+esc(c.claim_key)+'</td><td>'+esc(c.owner_agent_id)+'</td><td>'+mins+'m</td></tr>';
-  }
-  $('detail-claims-body').innerHTML=h+'</table>';
-}
-
-function renderDetailLocks(locks){
-  const now=Date.now();
-  const active=locks.filter(l=>!l.released_at&&new Date(l.expires_at).getTime()>=now);
-  if(!active.length){$('detail-locks-body').innerHTML='<div class="empty">None</div>';return}
-  let h='<table><tr><th>File</th><th>Agent</th><th>Expires</th></tr>';
-  for(const l of active){
-    const mins=Math.max(0,Math.floor((new Date(l.expires_at).getTime()-now)/60000));
-    h+='<tr><td>'+esc(l.file_path)+'</td><td>'+esc(l.agent_id)+'</td><td>'+mins+'m</td></tr>';
-  }
-  $('detail-locks-body').innerHTML=h+'</table>';
-}
-
-function renderDetailMessages(messages){
-  $('detail-msg-count').textContent=messages.length;
-  if(!messages.length){$('detail-messages-body').innerHTML='<div class="empty">No messages</div>';return}
-  let h='<table><tr><th>ID</th><th>Time</th><th>From</th><th>Kind</th><th>Body</th></tr>';
-  for(const m of messages){
-    h+='<tr><td>'+m.id+'</td><td>'+timeFmt(m.ts)+'</td>';
-    h+='<td>'+esc(m.from_agent)+'</td><td>'+kindBadge(m.kind)+'</td>';
-    h+='<td class="msg-body" title="'+esc(m.body)+'">'+esc(m.body)+'</td></tr>';
-  }
-  $('detail-messages-body').innerHTML=h+'</table>';
-}
-
-async function openThread(threadId){
-  selectedThread=threadId;
-  $('thread-detail-card').style.display='block';
-  await refreshDetail();
-  if(detailTimer)clearInterval(detailTimer);
-  detailTimer=setInterval(refreshDetail,3000);
-}
-
-function closeDetail(){
-  selectedThread=null;
-  $('thread-detail-card').style.display='none';
-  if(detailTimer){clearInterval(detailTimer);detailTimer=null}
-}
-
-async function refreshDetail(){
-  if(!selectedThread)return;
+async function pollMessages(){
   try{
-    const r=await fetch(BASE+'/v1/threads/'+encodeURIComponent(selectedThread));
+    const url=seeded
+      ?'/v1/messages?channel=general&since_id='+lastId
+      :'/v1/messages?channel=general&limit=50';
+    const r=await fetch(url);
     const j=await r.json();
-    if(!j.ok)return;
-    const d=j.result;
-    const t=d.thread||{};
-    $('detail-title').textContent=t.thread_id||'?';
-    $('detail-meta').textContent='Channel: '+(t.channel||'?')+' | Status: '+(t.status||'?')+
-      ' | Messages: '+(t.message_count||0)+' | Last activity: '+timeAgo(t.latest_message_ts);
-    renderDetailTasks(d.tasks||[],d.messages||[]);
-    renderDetailClaims(d.claims||[]);
-    renderDetailLocks(d.locks||[]);
-    renderDetailMessages(d.messages||[]);
-  }catch(e){console.error('Detail refresh error:',e)}
-}
-
-function renderHubInfo(info){
-  if(!info||!info.instance_id){
-    $('hub-info-body').innerHTML='<div class="empty">Not available (hub may not support /v1/hub-info yet)</div>';
-    return;
-  }
-  let h='<table>';
-  h+='<tr><td style="color:#64748b;width:100px">Instance</td><td style="font-size:.75rem">'+esc(info.instance_id)+'</td></tr>';
-  if(info.storage_path)h+='<tr><td style="color:#64748b">Storage</td><td style="font-size:.75rem;word-break:break-all;white-space:normal">'+esc(info.storage_path)+'</td></tr>';
-  if(info.wal_mode!==undefined){
-    const walBadge=info.wal_mode?badge('WAL enabled','green'):badge('WAL disabled','red');
-    h+='<tr><td style="color:#64748b">Journal</td><td>'+walBadge+'</td></tr>';
-  }
-  h+='</table>';
-  $('hub-info-body').innerHTML=h;
-}
-
-async function refresh(){
-  try{
-    let hubInfo=null;
-    try{
-      const r=await fetch(BASE+'/v1/hub-info');
-      const j=await r.json();
-      if(j.ok)hubInfo=j.result;
-    }catch(e){}
-    const [agents,claims,locks,threads]=await Promise.all([
-      fetchJSON('/v1/agents'),
-      fetchJSON('/v1/claims'),
-      fetchJSON('/v1/locks'),
-      fetchJSON('/v1/threads')
-    ]);
-    renderAgents(agents);
-    renderClaims(claims);
-    renderLocks(locks);
-    renderThreads(threads);
-    renderHubInfo(hubInfo);
-
+    if(j.ok){
+      if(j.result.length)appendMessages(j.result);
+      seeded=true;
+    }
     $('status-dot').className='dot dot-green';
     $('status-text').textContent='Connected';
-    $('last-update').textContent='Updated '+new Date().toLocaleTimeString();
-    errCount=0;
   }catch(e){
-    errCount++;
     $('status-dot').className='dot dot-red';
-    $('status-text').textContent='Error (retry in 5s)';
-    console.error('Dashboard refresh error:',e);
+    $('status-text').textContent='Disconnected';
   }
 }
 
-refresh();
-setInterval(refresh,5000);
+async function pollAgents(){
+  try{
+    const r=await fetch('/v1/agents');
+    const j=await r.json();
+    if(j.ok)renderAgents(j.result);
+  }catch(e){}
+}
+
+async function loadHubInfo(){
+  try{
+    const r=await fetch('/v1/hub-info');
+    const j=await r.json();
+    if(j.ok&&j.result){
+      const i=j.result;
+      $('hub-info').textContent='Instance: '+(i.instance_id||'?')+' | '+(i.wal_mode?'WAL':'no WAL');
+    }
+  }catch(e){}
+}
+
+async function sendMessage(){
+  const input=$('msg-input');
+  const body=input.value.trim();
+  if(!body)return;
+  input.value='';
+  try{
+    await fetch('/v1/messages',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({from_agent:'operator',channel:'general',kind:'chat',body:body})
+    });
+    await pollMessages();
+  }catch(e){
+    input.style.borderColor='#f87171';
+    setTimeout(()=>input.style.borderColor='',1500);
+  }
+}
+
+$('msg-input').addEventListener('keydown',e=>{if(e.key==='Enter')sendMessage()});
+$('send-btn').addEventListener('click',sendMessage);
+
+pollMessages();
+pollAgents();
+loadHubInfo();
+setInterval(pollMessages,3000);
+setInterval(pollAgents,5000);
 </script>
 </body>
 </html>"""
@@ -1283,9 +1128,12 @@ class _H(BaseHTTPRequestHandler):
 
 class _Srv(ThreadingMixIn, HTTPServer):
     daemon_threads = True
-    def __init__(self, cfg):
+    def __init__(self, cfg, *, spool_dir=DEFAULT_SPOOL_DIR):
         self.cfg, self.store = cfg, HubStore(cfg.storage_path)
         self._timer: threading.Timer | None = None
+        self._relay: FileRelayServer | None = None
+        self._relay_thread: threading.Thread | None = None
+        self._spool_dir = spool_dir
         super().__init__((cfg.listen_host, cfg.port), _H)
         self.bound_port = self.server_address[1]
         self.pidfile_path = _pidfile_path(cfg.storage_path)
@@ -1345,6 +1193,19 @@ class _Srv(ThreadingMixIn, HTTPServer):
                 "correctly on this storage backend"
             )
         self._schedule_prune()
+        self._start_relay()
+
+    def _start_relay(self):
+        base_url = _pidfile_url(self.cfg.listen_host, self.bound_port)
+        relay_cfg = FileRelayConfig(
+            base_url=base_url,
+            spool_dir=self._spool_dir,
+        )
+        ensure_spool_dirs(self._spool_dir)
+        self._relay = FileRelayServer(relay_cfg)
+        self._relay_thread = threading.Thread(target=self._relay.run, name="megahub-relay", daemon=True)
+        self._relay_thread.start()
+        self.log(f"relay started (spool={self._spool_dir})")
 
     def start_prune(self):
         self.start()
@@ -1441,18 +1302,22 @@ class _Srv(ThreadingMixIn, HTTPServer):
         )
 
     def stop(self):
+        if self._relay:
+            self._relay.request_stop()
+        if self._relay_thread and self._relay_thread.is_alive():
+            self._relay_thread.join(timeout=2.0)
         if self._timer: self._timer.cancel()
         self._cleanup_pidfile()
         self.store.close()
 
 
-def create_server(config=None):
+def create_server(config=None, *, spool_dir=DEFAULT_SPOOL_DIR):
     cfg = config or HubConfig()
     cfg.validate()
-    return _Srv(cfg)
+    return _Srv(cfg, spool_dir=spool_dir)
 
 
-def run_server(config=None):
+def run_server(config=None, *, spool_dir=DEFAULT_SPOOL_DIR):
     cfg = config or HubConfig()
     cfg.validate()
     if cfg.allow_remote:
@@ -1460,7 +1325,7 @@ def run_server(config=None):
             "[megahub] Warning: allow_remote=true exposes this daemon to non-local clients. "
             "There is no built-in auth in v1."
         )
-    srv = create_server(cfg)
+    srv = create_server(cfg, spool_dir=spool_dir)
     srv.start()
     try:
         srv.serve_forever()
@@ -1468,29 +1333,86 @@ def run_server(config=None):
         srv.stop()
         srv.server_close()
 
-def ensure_hub(host="127.0.0.1", port=8765, storage="megahub.sqlite3", timeout=5.0):
+def _probe_hub(url):
+    try:
+        with urllib.request.urlopen(urllib.request.Request(f"{url}/v1/channels", method="GET"), timeout=2): return True
+    except (urllib.error.URLError, OSError, TimeoutError): return False
+
+
+def _find_running_hub(storage="megahub.sqlite3", host="127.0.0.1", port=8765):
+    """Return (url, pid_info) for a running hub, or (None, None)."""
+    pid_info = _discover_pidfile(storage)
+    if pid_info and _probe_hub(pid_info["url"]):
+        return pid_info["url"], pid_info
+    base = _pidfile_url(host, port)
+    if _probe_hub(base):
+        return base, pid_info
+    return None, pid_info
+
+
+def stop_hub(storage="megahub.sqlite3", host="127.0.0.1", port=8765):
+    """Stop a running hub. Returns dict with stopped (bool) and details."""
+    import signal
+    url, pid_info = _find_running_hub(storage, host, port)
+    if url is None:
+        return {"stopped": False, "error": "no running hub found"}
+    if pid_info and pid_info.get("pid"):
+        pid = pid_info["pid"]
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError) as e:
+            return {"stopped": False, "error": f"failed to stop pid {pid}: {e}"}
+        pidfile = Path(pid_info.get("path", ""))
+        if pidfile.exists():
+            try:
+                pidfile.unlink()
+            except OSError:
+                pass
+        return {"stopped": True, "pid": pid, "url": url}
+    return {"stopped": False, "error": "hub is responding but no pidfile found to identify process"}
+
+
+def reset_hub(storage="megahub.sqlite3", host="127.0.0.1", port=8765):
+    """Stop the hub if running, then delete the SQLite database. Returns dict."""
+    url, _ = _find_running_hub(storage, host, port)
+    if url is not None:
+        result = stop_hub(storage, host, port)
+        if not result.get("stopped"):
+            return {"reset": False, "error": f"could not stop running hub: {result.get('error')}"}
+        time.sleep(0.3)
+    db = _storage_path(storage)
+    removed = []
+    for suffix in ("", "-wal", "-shm"):
+        p = Path(str(db) + suffix)
+        if p.exists():
+            try:
+                p.unlink()
+                removed.append(p.name)
+            except OSError as e:
+                return {"reset": False, "error": f"failed to remove {p}: {e}"}
+    if not removed:
+        return {"reset": True, "note": "database did not exist"}
+    return {"reset": True, "removed": removed}
+
+
+def ensure_hub(host="127.0.0.1", port=8765, storage="megahub.sqlite3", timeout=5.0, spool_dir=DEFAULT_SPOOL_DIR):
     """Check if a hub is running; if not, start one in the background.
     Returns dict with: running (bool), started (bool), url (str).
     The port binding itself is the mutex — only one process can bind."""
-    import subprocess, sys, time
-    import urllib.error as _ue, urllib.request as _ur
+    import subprocess, sys
     base = _pidfile_url(host, port)
-    def _probe(url):
-        try:
-            with _ur.urlopen(_ur.Request(f"{url}/v1/channels", method="GET"), timeout=2): return True
-        except (_ue.URLError, OSError, TimeoutError): return False
     pid_info = _discover_pidfile(storage)
-    if pid_info and _probe(pid_info["url"]): return {"running": True, "started": False, "url": pid_info["url"]}
-    if _probe(base): return {"running": True, "started": False, "url": base}
+    if pid_info and _probe_hub(pid_info["url"]): return {"running": True, "started": False, "url": pid_info["url"]}
+    if _probe_hub(base): return {"running": True, "started": False, "url": base}
     try:
         subprocess.Popen([sys.executable, __file__, "--host", host, "--port", str(port),
-            "--storage", storage, "--quiet"], stdout=subprocess.DEVNULL,
+            "--storage", storage, "--spool-dir", spool_dir, "--quiet"], stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError: return {"running": False, "started": False, "url": base, "error": "spawn failed"}
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(0.15)
-        if _probe(base): return {"running": True, "started": True, "url": base}
+        if _probe_hub(base): return {"running": True, "started": True, "url": base}
     return {"running": False, "started": True, "url": base, "error": "timeout"}
 
 
@@ -1970,32 +1892,6 @@ def run_smoke_agent(
     return 0
 
 def main():
-    ap = argparse.ArgumentParser(description="Megahub — single-file agent coordination hub")
-    sub = ap.add_subparsers(dest="command")
-    ap.add_argument("--host", default="127.0.0.1"); ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--storage", default="megahub.sqlite3"); ap.add_argument("--allow-remote", action="store_true")
-    ap.add_argument("--quiet", action="store_true")
-    ens = sub.add_parser("ensure", help="Start hub if not already running, then exit")
-    ens.add_argument("--host", default="127.0.0.1"); ens.add_argument("--port", type=int, default=8765)
-    ens.add_argument("--storage", default="megahub.sqlite3"); ens.add_argument("--timeout", type=float, default=5.0)
-    a = ap.parse_args()
-    if a.command == "ensure":
-        r = ensure_hub(host=a.host, port=a.port, storage=a.storage, timeout=a.timeout)
-        print(json.dumps(r, indent=2))
-        raise SystemExit(0 if r.get("running") else 1)
-    cfg = HubConfig(
-        listen_host=a.host,
-        port=a.port,
-        storage_path=a.storage,
-        allow_remote=a.allow_remote,
-        log_events=not a.quiet,
-    )
-    try:
-        run_server(cfg)
-    except KeyboardInterrupt:
-        pass
-
-def main():
     ap = argparse.ArgumentParser(description="Megahub - single-file agent coordination hub")
     sub = ap.add_subparsers(dest="command")
     ap.add_argument("--host", default="127.0.0.1")
@@ -2003,12 +1899,24 @@ def main():
     ap.add_argument("--storage", default="megahub.sqlite3")
     ap.add_argument("--allow-remote", action="store_true")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--spool-dir", default=DEFAULT_SPOOL_DIR)
 
     ens = sub.add_parser("ensure", help="Start hub if not already running, then exit")
     ens.add_argument("--host", default="127.0.0.1")
     ens.add_argument("--port", type=int, default=8765)
     ens.add_argument("--storage", default="megahub.sqlite3")
+    ens.add_argument("--spool-dir", default=DEFAULT_SPOOL_DIR)
     ens.add_argument("--timeout", type=float, default=5.0)
+
+    stp = sub.add_parser("stop", help="Stop a running hub")
+    stp.add_argument("--host", default="127.0.0.1")
+    stp.add_argument("--port", type=int, default=8765)
+    stp.add_argument("--storage", default="megahub.sqlite3")
+
+    rst = sub.add_parser("reset", help="Stop the hub and delete the database")
+    rst.add_argument("--host", default="127.0.0.1")
+    rst.add_argument("--port", type=int, default=8765)
+    rst.add_argument("--storage", default="megahub.sqlite3")
 
     relay = sub.add_parser("relay", help="Forward file-spooled relay requests to the local hub")
     relay.add_argument("--base-url", default=DEFAULT_BASE_URL)
@@ -2029,9 +1937,17 @@ def main():
 
     a = ap.parse_args()
     if a.command == "ensure":
-        r = ensure_hub(host=a.host, port=a.port, storage=a.storage, timeout=a.timeout)
+        r = ensure_hub(host=a.host, port=a.port, storage=a.storage, timeout=a.timeout, spool_dir=a.spool_dir)
         print(json.dumps(r, indent=2))
         raise SystemExit(0 if r.get("running") else 1)
+    if a.command == "stop":
+        r = stop_hub(storage=a.storage, host=a.host, port=a.port)
+        print(json.dumps(r, indent=2))
+        raise SystemExit(0 if r.get("stopped") else 1)
+    if a.command == "reset":
+        r = reset_hub(storage=a.storage, host=a.host, port=a.port)
+        print(json.dumps(r, indent=2))
+        raise SystemExit(0 if r.get("reset") else 1)
     if a.command == "relay":
         cfg = FileRelayConfig(
             base_url=a.base_url,
@@ -2069,7 +1985,7 @@ def main():
         log_events=not a.quiet,
     )
     try:
-        run_server(cfg)
+        run_server(cfg, spool_dir=a.spool_dir)
     except KeyboardInterrupt:
         pass
 

@@ -15,6 +15,32 @@ This repo ships one canonical implementation: [`megahub.py`](./megahub.py).
 - a host-side relay for constrained sandboxes
 - a deterministic smoke runner for validating mixed HTTP and relay agents
 
+## Starting & Stopping
+
+Start the hub (idempotent — safe to run multiple times):
+
+```bash
+python megahub.py ensure
+```
+
+The hub runs in the background on `http://127.0.0.1:8765`. Open that URL in a browser to see the live dashboard.
+
+The relay for sandboxed agents starts automatically alongside the hub — no extra commands needed.
+
+Stop the hub (and relay):
+
+```bash
+python megahub.py stop
+```
+
+Stop the hub and delete all data (sessions, messages, claims, locks, tasks):
+
+```bash
+python megahub.py reset
+```
+
+All commands accept `--host`, `--port`, `--storage`, and `--spool-dir` flags if you're not using the defaults.
+
 ## Choose The Right Mode
 
 ### Mode 1: Single Hub
@@ -62,17 +88,21 @@ Use this when the sandbox can write ordinary files into the shared workspace, bu
 
 In this mode:
 
-1. the host runs the real Megahub HTTP server
-2. the host runs the relay watcher
-3. the sandbox writes request files into the relay spool directory
-4. the relay forwards those requests to the real HTTP hub
-5. the relay writes response files back for the sandbox to read
+1. the host runs Megahub (the relay starts automatically as a background thread)
+2. the sandbox writes request files into the relay spool directory
+3. the relay forwards those requests to the HTTP hub
+4. the relay writes response files back for the sandbox to read
 
 Start the host side:
 
 ```bash
 python megahub.py ensure
-python megahub.py relay --spool-dir .megahub-relay
+```
+
+The relay is built in and starts automatically. To use a custom spool directory:
+
+```bash
+python megahub.py ensure --spool-dir .megahub-relay
 ```
 
 The relay is intentionally append-only:
@@ -109,7 +139,6 @@ Use this when the sandbox cannot reach host localhost and cannot safely use SQLi
 > Megahub is available in `megahub.py`, but you must use relay transport instead of direct HTTP or direct SQLite.
 > The host is already running:
 > `python megahub.py ensure`
-> `python megahub.py relay --spool-dir .megahub-relay`
 > Your requests must go through the shared relay spool directory `.megahub-relay`.
 > Do not try to call `http://127.0.0.1:8765` directly unless your sandbox has confirmed localhost access.
 
@@ -131,7 +160,6 @@ Example mixed validation:
 
 ```bash
 python megahub.py ensure
-python megahub.py relay --spool-dir .megahub-relay
 
 python megahub.py smoke-agent --role smoke-a --transport http
 python megahub.py smoke-agent --role smoke-b --transport relay --relay-dir .megahub-relay
@@ -147,9 +175,10 @@ This validates that:
 ## Common Commands
 
 ```bash
-python megahub.py ensure
-python megahub.py --host 127.0.0.1 --port 8765 --storage megahub.sqlite3
-python megahub.py relay --spool-dir .megahub-relay
+python megahub.py ensure                # start hub (idempotent)
+python megahub.py stop                  # stop the running hub
+python megahub.py reset                 # stop hub + delete database
+python megahub.py --port 8765           # run hub + relay in foreground
 python megahub.py smoke-agent --role smoke-b --transport relay --relay-dir .megahub-relay
 curl http://127.0.0.1:8765/v1/hub-info
 curl http://127.0.0.1:8765/v1/threads
