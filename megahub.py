@@ -1,24 +1,94 @@
 #!/usr/bin/env python3
 """Megahub — single-file local-first agent coordination hub.
 
-    python megahub.py [--port 8765] [--storage megahub.sqlite3]
+    python megahub.py [--port 6969] [--storage megahub.sqlite3]
 
-Zero dependencies beyond Python 3.10+. Provides 12 REST endpoints for
-multi-agent coordination via HTTP + SQLite.
+Zero dependencies beyond Python 3.10+. HTTP + SQLite coordination for
+multi-agent systems. All responses are JSON: {"ok": true, "result": ...}
+or {"ok": false, "error": "..."}.
+
+REST API — every endpoint at a glance:
+
+  Sessions & Presence
+    POST   /v1/sessions              Register agent (agent_id required)
+    DELETE /v1/sessions/{id}         Close session
+    GET    /v1/agents                List live agents
+
+  Channels & Messages
+    GET    /v1/channels              List channels
+    POST   /v1/channels              Create channel (name required)
+    POST   /v1/messages              Post message (from_agent, body required)
+    GET    /v1/messages              Query by ?channel= and/or ?thread_id=
+    GET    /v1/events                Unified feed (?agent_id= required, ?since_id=)
+    GET    /v1/inbox/{agent_id}      Direct messages for one agent
+
+  Threads
+    GET    /v1/threads               List thread summaries
+    GET    /v1/threads/{id}          Thread detail with messages
+
+  Claims (atomic task ownership)
+    POST   /v1/claims                Acquire (owner_agent_id, claim_key required)
+    POST   /v1/claims/refresh        Refresh TTL
+    POST   /v1/claims/release        Release
+    GET    /v1/claims                List (?active_only=true)
+
+  File Locks (advisory per-file locks)
+    POST   /v1/locks                 Acquire (agent_id, file_path required)
+    POST   /v1/locks/refresh         Refresh TTL
+    POST   /v1/locks/release         Release
+    GET    /v1/locks                 List (?active_only=true)
+
+  Tasks (structured subtasks with rollup)
+    GET    /v1/tasks                 List (?status=open, ?parent_id=)
+    POST   /v1/tasks/{id}/complete   Mark done (auto-rolls-up parent)
+
+  Admin
+    GET    /v1/hub-info              Hub config and instance info
+    POST   /v1/shutdown              Graceful shutdown (?delay_sec=60)
+    POST   /v1/shutdown/cancel       Cancel pending shutdown
+    GET    /                         Live HTML dashboard
+
+Default channel: "general" — all agents should join #general first.
+This is the shared meeting point. Use /v1/hub-info to confirm (returns
+default_channel). Create or join other channels only when needed.
+
+Polling convention: use ?since_id=<last_seen_id>&timeout=<sec> for
+long-poll. Messages, events, and inbox all support since_id + limit.
+
+Quick-start curl examples:
+  curl localhost:6969/v1/channels
+  curl -X POST localhost:6969/v1/sessions -d '{"agent_id":"my-agent"}'
+  curl -X POST localhost:6969/v1/messages \\
+       -d '{"from_agent":"my-agent","channel":"general","body":"hello"}'
+  curl 'localhost:6969/v1/messages?channel=general&since_id=0'
+  curl 'localhost:6969/v1/events?agent_id=my-agent&since_id=0&timeout=5'
+
+Python API (import megahub):
+  ensure_hub(host, port, storage, timeout) -> dict   # start if needed
+  create_server(config) -> _Srv                      # create server obj
+  run_server(config)                                 # blocking serve
+  stop_hub(storage, host, port) -> dict              # graceful stop
+  reset_hub(storage, host, port) -> dict             # stop + delete DB
 
 Deployment modes:
-  1. Single hub: one process serves all agents (default).
-  2. Shared-filesystem: multiple hub processes on different ports or
-     machines, all pointing --storage at the SAME SQLite file on a
-     shared/mounted filesystem. SQLite WAL mode handles concurrent
-     access. Messages, claims, and locks are visible across all hubs.
-  3. Sandbox relay: a host-side relay forwards file-spooled requests
-     for sandboxes that can write workspace files but cannot reach
-     host localhost or safely use SQLite on the shared mount.
+  1. Single hub  — one process serves all agents (default).
+  2. Shared-filesystem — multiple hubs, same --storage SQLite file.
+  3. Sandbox relay — file-spooled forwarding for sandboxed agents.
 
-Shared-filesystem example (two sandboxed agents):
-  # Sandbox A:  python megahub.py --port 8765 --storage /shared/megahub.sqlite3
-  # Sandbox B:  python megahub.py --port 9876 --storage /shared/megahub.sqlite3
+File layout (search for '# ──' section markers to navigate):
+  ~90-115   Imports and constants
+  ~170      HubConfig dataclass
+  ~200-650  HubStore — SQLite CRUD (sessions, messages, claims, locks, tasks)
+  ~655-760  Route patterns (_P dict) + request parsing helpers
+  ~760-1040 _H request handler — do_GET / do_POST / do_DELETE implementations
+  ~1044-1290 _Srv server class (lifecycle, relay, shutdown timer)
+  ~1293-1380 Public API functions (ensure_hub, create/run/stop/reset)
+  ~1520-1650 File relay system (FileRelayClient, FileRelayServer)
+  ~1654-1875 Smoke test agent
+  ~1880-2175 DASHBOARD_HTML (web UI — not needed for API usage)
+  ~2178+     CLI main()
+
+Full protocol specification: docs/PROTOCOL.md
 """
 from __future__ import annotations
 import argparse, hashlib, json, os, re, sqlite3, tempfile, threading, time, uuid
@@ -33,195 +103,19 @@ import urllib.parse
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
+# ── Megahub Architecture ──────────────────────────────────────────────
+# HubConfig -> HubStore (SQLite) -> _H (HTTP handler) -> _Srv (server)
+# Public API: create_server / run_server / ensure_hub / stop_hub / reset_hub
+# Route table: see _P dict (~line 655)  |  Full spec: docs/PROTOCOL.md
+
 __version__ = "0.1.0"
 LOCAL_BIND_HOSTS = {"127.0.0.1", "localhost", "::1"}
 DEFAULT_SPOOL_DIR = ".megahub-relay"
-DEFAULT_BASE_URL = "http://127.0.0.1:8765"
+DEFAULT_BASE_URL = "http://127.0.0.1:6969"
 DEFAULT_CHANNEL = "smoke-room"
 DEFAULT_THREAD_ID = "smoke-relay-001"
 DEFAULT_CLAIM_KEY = "smoke-claim-001"
 
-DASHBOARD_HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Megahub</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
-  background:#0f172a;color:#e2e8f0;display:flex;flex-direction:column;height:100vh}
-#header{flex-shrink:0;display:flex;align-items:center;gap:.75rem;padding:.6rem 1rem;
-  background:#1e293b;border-bottom:1px solid #334155}
-#header h1{font-size:1.1rem;font-weight:700;color:#38bdf8;white-space:nowrap}
-.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
-.dot-green{background:#34d399}.dot-red{background:#f87171}
-#status-text{font-size:.75rem;color:#64748b;white-space:nowrap}
-#agents-bar{display:flex;gap:.4rem;flex-wrap:wrap;margin-left:auto}
-.agent-pill{font-size:.7rem;padding:.15rem .5rem;border-radius:9999px;
-  background:#334155;color:#e2e8f0;white-space:nowrap;display:flex;align-items:center;gap:.3rem}
-.agent-pill .dot{width:6px;height:6px}
-#feed{flex:1;overflow-y:auto;padding:.75rem 1rem;display:flex;flex-direction:column;gap:.15rem}
-.msg{font-size:.82rem;line-height:1.5;word-wrap:break-word}
-.msg-time{color:#475569;margin-right:.4rem;font-size:.75rem}
-.msg-from{font-weight:600;margin-right:.3rem}
-.msg-operator .msg-from{color:#38bdf8}
-.msg-system{color:#64748b;font-style:italic}
-.badge{display:inline-block;padding:.05rem .35rem;border-radius:.2rem;font-size:.65rem;
-  font-weight:600;margin-right:.3rem;vertical-align:middle}
-.badge-notice{background:#713f12;color:#fbbf24}
-.badge-task{background:#3b0764;color:#c084fc}
-.badge-artifact{background:#064e3b;color:#34d399}
-.badge-claim{background:#713f12;color:#fbbf24}
-.badge-release{background:#7f1d1d;color:#f87171}
-#input-bar{flex-shrink:0;display:flex;gap:.5rem;padding:.5rem 1rem;
-  background:#1e293b;border-top:1px solid #334155}
-#msg-input{flex:1;background:#0f172a;border:1px solid #334155;border-radius:.375rem;
-  color:#e2e8f0;padding:.4rem .6rem;font-size:.85rem;font-family:inherit;outline:none}
-#msg-input:focus{border-color:#38bdf8}
-#msg-input::placeholder{color:#475569}
-#send-btn{background:#1e3a5f;color:#60a5fa;border:1px solid #334155;border-radius:.375rem;
-  padding:.4rem .8rem;font-size:.82rem;cursor:pointer;font-family:inherit;white-space:nowrap}
-#send-btn:hover{background:#2d4a6f}
-#footer{flex-shrink:0;padding:.3rem 1rem;font-size:.7rem;color:#475569;
-  background:#1e293b;border-top:1px solid #334155;display:flex;gap:1rem;align-items:center}
-#footer code{color:#64748b}
-.empty{color:#475569;font-style:italic;padding:2rem;text-align:center}
-</style>
-</head>
-<body>
-<div id="header">
-  <h1>Megahub</h1>
-  <span class="dot dot-green" id="status-dot"></span>
-  <span id="status-text">Connecting...</span>
-  <div id="agents-bar"></div>
-</div>
-<div id="feed"><div class="empty">Loading messages...</div></div>
-<div id="input-bar">
-  <input id="msg-input" type="text" placeholder="Send a message to agents..." autocomplete="off">
-  <button id="send-btn">Send</button>
-</div>
-<div id="footer">
-  <span id="hub-info"></span>
-  <span style="margin-left:auto">CLI: <code>python megahub.py stop</code> &middot; <code>python megahub.py reset</code></span>
-</div>
-<script>
-const NICK_COLORS=['#38bdf8','#34d399','#fbbf24','#f87171','#c084fc','#fb923c','#2dd4bf','#e879f9'];
-let lastId=0,seeded=false;
-
-function $(id){return document.getElementById(id)}
-function esc(s){if(s==null)return'';const d=document.createElement('div');d.textContent=String(s);return d.innerHTML}
-function timeFmt(iso){if(!iso)return'';try{return new Date(iso).toLocaleTimeString()}catch(e){return iso}}
-function nickColor(name){
-  let h=0;for(let i=0;i<name.length;i++)h=((h<<5)-h+name.charCodeAt(i))|0;
-  return NICK_COLORS[Math.abs(h)%NICK_COLORS.length];
-}
-
-function shouldAutoScroll(){
-  const f=$('feed');return f.scrollTop+f.clientHeight>=f.scrollHeight-60;
-}
-
-function appendMessages(msgs){
-  const f=$('feed');
-  const wasEmpty=f.querySelector('.empty');
-  if(wasEmpty)f.innerHTML='';
-  const doScroll=shouldAutoScroll();
-  for(const m of msgs){
-    const div=document.createElement('div');
-    div.className='msg';
-    const isOp=m.from_agent==='operator';
-    const isSys=m.from_agent==='system';
-    if(isOp)div.classList.add('msg-operator');
-    if(isSys)div.classList.add('msg-system');
-    let kindBadge='';
-    if(m.kind&&m.kind!=='chat'){
-      kindBadge='<span class="badge badge-'+esc(m.kind)+'">'+esc(m.kind)+'</span>';
-    }
-    const color=isOp?'#38bdf8':isSys?'#64748b':nickColor(m.from_agent);
-    div.innerHTML='<span class="msg-time">'+timeFmt(m.ts)+'</span>'
-      +'<span class="msg-from" style="color:'+color+'">'+esc(m.from_agent)+'</span>'
-      +kindBadge+esc(m.body);
-    f.appendChild(div);
-    if(m.id>lastId)lastId=m.id;
-  }
-  if(doScroll)f.scrollTop=f.scrollHeight;
-}
-
-function renderAgents(agents){
-  const bar=$('agents-bar');
-  if(!agents.length){bar.innerHTML='';return}
-  bar.innerHTML=agents.map(a=>
-    '<span class="agent-pill"><span class="dot dot-green"></span>'+esc(a.display_name||a.agent_id)+'</span>'
-  ).join('');
-}
-
-async function pollMessages(){
-  try{
-    const url=seeded
-      ?'/v1/messages?channel=general&since_id='+lastId
-      :'/v1/messages?channel=general&limit=50';
-    const r=await fetch(url);
-    const j=await r.json();
-    if(j.ok){
-      if(j.result.length)appendMessages(j.result);
-      seeded=true;
-    }
-    $('status-dot').className='dot dot-green';
-    $('status-text').textContent='Connected';
-  }catch(e){
-    $('status-dot').className='dot dot-red';
-    $('status-text').textContent='Disconnected';
-  }
-}
-
-async function pollAgents(){
-  try{
-    const r=await fetch('/v1/agents');
-    const j=await r.json();
-    if(j.ok)renderAgents(j.result);
-  }catch(e){}
-}
-
-async function loadHubInfo(){
-  try{
-    const r=await fetch('/v1/hub-info');
-    const j=await r.json();
-    if(j.ok&&j.result){
-      const i=j.result;
-      $('hub-info').textContent='Instance: '+(i.instance_id||'?')+' | '+(i.wal_mode?'WAL':'no WAL');
-    }
-  }catch(e){}
-}
-
-async function sendMessage(){
-  const input=$('msg-input');
-  const body=input.value.trim();
-  if(!body)return;
-  input.value='';
-  try{
-    await fetch('/v1/messages',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({from_agent:'operator',channel:'general',kind:'chat',body:body})
-    });
-    await pollMessages();
-  }catch(e){
-    input.style.borderColor='#f87171';
-    setTimeout(()=>input.style.borderColor='',1500);
-  }
-}
-
-$('msg-input').addEventListener('keydown',e=>{if(e.key==='Enter')sendMessage()});
-$('send-btn').addEventListener('click',sendMessage);
-
-pollMessages();
-pollAgents();
-loadHubInfo();
-setInterval(pollMessages,3000);
-setInterval(pollAgents,5000);
-</script>
-</body>
-</html>"""
 _utcnow = lambda: datetime.now(timezone.utc)
 _to_iso = lambda dt: dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 def _from_iso(v):
@@ -281,10 +175,10 @@ _candidate_pidfiles = _pidfile_candidates
 
 @dataclass(slots=True)
 class HubConfig:
-    listen_host: str = "127.0.0.1"; port: int = 8765; allow_remote: bool = False
+    listen_host: str = "127.0.0.1"; port: int = 6969; allow_remote: bool = False
     storage_path: str = "megahub.sqlite3"; log_events: bool = True
-    presence_ttl_sec: int = 120; max_body_chars: int = 16_000
-    max_attachment_chars: int = 32_000; max_attachments: int = 16; max_query_limit: int = 500
+    presence_ttl_sec: int = 120; max_body_chars: int = 128_000
+    max_attachment_chars: int = 256_000; max_attachments: int = 32; max_query_limit: int = 500
     def validate(self):
         if self.port < 0 or self.port > 65535: raise ValueError("port out of range")
         if self.presence_ttl_sec < 5: raise ValueError("presence_ttl_sec must be >= 5")
@@ -774,6 +668,7 @@ _P = {n: re.compile(p) for n, p in [
     ("claims", r"^/v1/claims$"), ("claims_refresh", r"^/v1/claims/refresh$"), ("claims_rel", r"^/v1/claims/release$"),
     ("locks", r"^/v1/locks$"), ("locks_refresh", r"^/v1/locks/refresh$"), ("locks_rel", r"^/v1/locks/release$"),
     ("tasks", r"^/v1/tasks$"), ("task_complete", r"^/v1/tasks/(?P<id>\d+)/complete$"),
+    ("shutdown", r"^/v1/shutdown$"), ("shutdown_cancel", r"^/v1/shutdown/cancel$"),
     ("root", r"^/$")]}
 
 def _norm_msg(p, cfg):
@@ -921,6 +816,10 @@ class _H(BaseHTTPRequestHandler):
                 "instance_id": self.server.instance_id,
                 "journal_mode": self.server.store.journal_mode,
                 "wal_mode": self.server.store.wal_enabled,
+                "default_channel": "general",
+                "max_body_chars": cfg.max_body_chars,
+                "max_attachment_chars": cfg.max_attachment_chars,
+                "max_attachments": cfg.max_attachments,
             }})
         if _P["events"].match(path):
             aid = q.get("agent_id", [None])[0]
@@ -974,6 +873,9 @@ class _H(BaseHTTPRequestHandler):
                 except ValueError as e: return self._err(str(e))
             if st is not None and st not in ("open","done"): return self._err("status must be 'open' or 'done'")
             return self._ok({"ok":True,"result":s.list_tasks(parent_id=pid,status=st,channel=ch,thread_id=tid)})
+        if _P["shutdown"].match(path):
+            status = self.server.get_shutdown_status()
+            return self._ok({"ok":True,"result":status})
         self._err("not found", 404)
 
     def do_POST(self):
@@ -1109,6 +1011,24 @@ class _H(BaseHTTPRequestHandler):
                         metadata={"auto_rollup":True,"parent_task_id":t["parent_task_id"]})
                     result["parent_completed"] = True
             return self._ok(result)
+        if _P["shutdown_cancel"].match(path):
+            try:
+                self._j()
+                self.server.cancel_shutdown()
+            except ValueError as e:
+                return self._err(str(e))
+            return self._ok({"ok":True,"result":{"status":"shutdown_cancelled"}})
+        if _P["shutdown"].match(path):
+            try:
+                p = self._j()
+                delay = int(p.get("delay_sec", 60))
+                if delay < 0: raise ValueError("delay_sec must be >= 0")
+                if delay > 3600: raise ValueError("delay_sec must be <= 3600")
+                self.server.initiate_shutdown(delay)
+            except ValueError as e:
+                return self._err(str(e))
+            status = self.server.get_shutdown_status()
+            return self._ok({"ok":True,"result":{"status":"shutdown_initiated",**(status or {})}})
         try:
             raw = self.headers.get("Content-Length", "0")
             n = int(raw)
@@ -1133,6 +1053,9 @@ class _Srv(ThreadingMixIn, HTTPServer):
         self._timer: threading.Timer | None = None
         self._relay: FileRelayServer | None = None
         self._relay_thread: threading.Thread | None = None
+        self._shutdown_timer: threading.Timer | None = None
+        self._shutdown_deadline: float | None = None
+        self._shutdown_delay: int | None = None
         self._spool_dir = spool_dir
         super().__init__((cfg.listen_host, cfg.port), _H)
         self.bound_port = self.server_address[1]
@@ -1302,6 +1225,9 @@ class _Srv(ThreadingMixIn, HTTPServer):
         )
 
     def stop(self):
+        if self._shutdown_timer:
+            self._shutdown_timer.cancel()
+            self._shutdown_timer = None
         if self._relay:
             self._relay.request_stop()
         if self._relay_thread and self._relay_thread.is_alive():
@@ -1309,6 +1235,64 @@ class _Srv(ThreadingMixIn, HTTPServer):
         if self._timer: self._timer.cancel()
         self._cleanup_pidfile()
         self.store.close()
+
+    def _post_system_notice(self, body, *, metadata=None):
+        self.store.create_message(
+            from_agent="system", to_agent=None, channel="general",
+            kind="notice", body=body, attachments=[],
+            reply_to=None, thread_id=None, metadata=metadata or {},
+        )
+
+    def initiate_shutdown(self, delay_sec=60):
+        if self._shutdown_timer is not None or self._shutdown_deadline is not None:
+            raise ValueError("shutdown already pending")
+        if delay_sec == 0:
+            self._post_system_notice(
+                "Hub is shutting down now.",
+                metadata={"shutdown": True, "delay_sec": 0},
+            )
+            self.log("shutdown initiated (immediate)")
+            threading.Thread(target=self._execute_shutdown, daemon=True).start()
+            return
+        self._shutdown_delay = delay_sec
+        self._shutdown_deadline = time.monotonic() + delay_sec
+        self._post_system_notice(
+            f"Hub shutdown initiated. Shutting down in {delay_sec} seconds.",
+            metadata={"shutdown": True, "delay_sec": delay_sec},
+        )
+        self.log(f"shutdown initiated (delay={delay_sec}s)")
+        self._shutdown_timer = threading.Timer(delay_sec, self._execute_shutdown)
+        self._shutdown_timer.daemon = True
+        self._shutdown_timer.start()
+
+    def cancel_shutdown(self):
+        if self._shutdown_timer is None and self._shutdown_deadline is None:
+            raise ValueError("no shutdown pending")
+        if self._shutdown_timer:
+            self._shutdown_timer.cancel()
+        self._shutdown_timer = None
+        self._shutdown_deadline = None
+        self._shutdown_delay = None
+        self._post_system_notice(
+            "Hub shutdown cancelled.",
+            metadata={"shutdown_cancelled": True},
+        )
+        self.log("shutdown cancelled")
+
+    def get_shutdown_status(self):
+        if self._shutdown_deadline is None:
+            return None
+        remaining = max(0, int(self._shutdown_deadline - time.monotonic()))
+        return {"remaining_sec": remaining, "delay_sec": self._shutdown_delay}
+
+    def _execute_shutdown(self):
+        self._shutdown_timer = None
+        self._post_system_notice(
+            "Hub is shutting down now.",
+            metadata={"shutdown": True, "final": True},
+        )
+        self.log("executing shutdown")
+        self.shutdown()
 
 
 def create_server(config=None, *, spool_dir=DEFAULT_SPOOL_DIR):
@@ -1339,7 +1323,7 @@ def _probe_hub(url):
     except (urllib.error.URLError, OSError, TimeoutError): return False
 
 
-def _find_running_hub(storage="megahub.sqlite3", host="127.0.0.1", port=8765):
+def _find_running_hub(storage="megahub.sqlite3", host="127.0.0.1", port=6969):
     """Return (url, pid_info) for a running hub, or (None, None)."""
     pid_info = _discover_pidfile(storage)
     if pid_info and _probe_hub(pid_info["url"]):
@@ -1350,7 +1334,7 @@ def _find_running_hub(storage="megahub.sqlite3", host="127.0.0.1", port=8765):
     return None, pid_info
 
 
-def stop_hub(storage="megahub.sqlite3", host="127.0.0.1", port=8765):
+def stop_hub(storage="megahub.sqlite3", host="127.0.0.1", port=6969):
     """Stop a running hub. Returns dict with stopped (bool) and details."""
     import signal
     url, pid_info = _find_running_hub(storage, host, port)
@@ -1372,7 +1356,7 @@ def stop_hub(storage="megahub.sqlite3", host="127.0.0.1", port=8765):
     return {"stopped": False, "error": "hub is responding but no pidfile found to identify process"}
 
 
-def reset_hub(storage="megahub.sqlite3", host="127.0.0.1", port=8765):
+def reset_hub(storage="megahub.sqlite3", host="127.0.0.1", port=6969):
     """Stop the hub if running, then delete the SQLite database. Returns dict."""
     url, _ = _find_running_hub(storage, host, port)
     if url is not None:
@@ -1395,7 +1379,8 @@ def reset_hub(storage="megahub.sqlite3", host="127.0.0.1", port=8765):
     return {"reset": True, "removed": removed}
 
 
-def ensure_hub(host="127.0.0.1", port=8765, storage="megahub.sqlite3", timeout=5.0, spool_dir=DEFAULT_SPOOL_DIR):
+def ensure_hub(host="127.0.0.1", port=6969, storage="megahub.sqlite3", timeout=5.0, spool_dir=DEFAULT_SPOOL_DIR,
+               max_body_chars=128_000, max_attachment_chars=256_000, max_attachments=32):
     """Check if a hub is running; if not, start one in the background.
     Returns dict with: running (bool), started (bool), url (str).
     The port binding itself is the mutex — only one process can bind."""
@@ -1406,7 +1391,11 @@ def ensure_hub(host="127.0.0.1", port=8765, storage="megahub.sqlite3", timeout=5
     if _probe_hub(base): return {"running": True, "started": False, "url": base}
     try:
         subprocess.Popen([sys.executable, __file__, "--host", host, "--port", str(port),
-            "--storage", storage, "--spool-dir", spool_dir, "--quiet"], stdout=subprocess.DEVNULL,
+            "--storage", storage, "--spool-dir", spool_dir,
+            "--max-body-chars", str(max_body_chars),
+            "--max-attachment-chars", str(max_attachment_chars),
+            "--max-attachments", str(max_attachments),
+            "--quiet"], stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError: return {"running": False, "started": False, "url": base, "error": "spawn failed"}
     deadline = time.monotonic() + timeout
@@ -1891,31 +1880,337 @@ def run_smoke_agent(
     }), "post verifier notice")
     return 0
 
+# ── Dashboard HTML ────────────────────────────────────────────────────
+# Served by GET / — the live web dashboard. Moved to bottom of file
+# so scanning agents see API code in the first 1000 lines.
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Megahub</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
+  background:#0f172a;color:#e2e8f0;display:flex;flex-direction:column;height:100vh}
+#header{flex-shrink:0;display:flex;align-items:center;gap:.75rem;padding:.6rem 1rem;
+  background:#1e293b;border-bottom:1px solid #334155}
+#header h1{font-size:1.1rem;font-weight:700;color:#38bdf8;white-space:nowrap}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
+.dot-green{background:#34d399}.dot-red{background:#f87171}
+#status-text{font-size:.75rem;color:#64748b;white-space:nowrap}
+#agents-bar{display:flex;gap:.4rem;flex-wrap:wrap;margin-left:auto}
+.agent-pill{font-size:.7rem;padding:.15rem .5rem;border-radius:9999px;
+  background:#334155;color:#e2e8f0;white-space:nowrap;display:flex;align-items:center;gap:.3rem}
+.agent-pill .dot{width:6px;height:6px}
+#feed{flex:1;overflow-y:auto;padding:.75rem 1rem;display:flex;flex-direction:column;gap:.15rem}
+.msg{font-size:.82rem;line-height:1.5;word-wrap:break-word}
+.msg-time{color:#475569;margin-right:.4rem;font-size:.75rem}
+.msg-from{font-weight:600;margin-right:.3rem}
+.msg-operator .msg-from{color:#38bdf8}
+.msg-system{color:#64748b;font-style:italic}
+.badge{display:inline-block;padding:.05rem .35rem;border-radius:.2rem;font-size:.65rem;
+  font-weight:600;margin-right:.3rem;vertical-align:middle}
+.badge-notice{background:#713f12;color:#fbbf24}
+.badge-task{background:#3b0764;color:#c084fc}
+.badge-artifact{background:#064e3b;color:#34d399}
+.badge-claim{background:#713f12;color:#fbbf24}
+.badge-release{background:#7f1d1d;color:#f87171}
+#input-bar{flex-shrink:0;display:flex;gap:.5rem;padding:.5rem 1rem;
+  background:#1e293b;border-top:1px solid #334155}
+#msg-input{flex:1;background:#0f172a;border:1px solid #334155;border-radius:.375rem;
+  color:#e2e8f0;padding:.4rem .6rem;font-size:.85rem;font-family:inherit;outline:none}
+#msg-input:focus{border-color:#38bdf8}
+#msg-input::placeholder{color:#475569}
+#send-btn{background:#1e3a5f;color:#60a5fa;border:1px solid #334155;border-radius:.375rem;
+  padding:.4rem .8rem;font-size:.82rem;cursor:pointer;font-family:inherit;white-space:nowrap}
+#send-btn:hover{background:#2d4a6f}
+#footer{flex-shrink:0;padding:.3rem 1rem;font-size:.7rem;color:#475569;
+  background:#1e293b;border-top:1px solid #334155;display:flex;gap:1rem;align-items:center}
+#footer code{color:#64748b}
+.empty{color:#475569;font-style:italic;padding:2rem;text-align:center}
+</style>
+</head>
+<body>
+<div id="header">
+  <h1>Megahub</h1>
+  <span class="dot dot-green" id="status-dot"></span>
+  <span id="status-text">Connecting...</span>
+  <span id="channel-indicator" style="margin-left:.7rem;color:#94a3b8;font-size:.85rem;font-weight:400">#general</span>
+  <div id="agents-bar"></div>
+</div>
+<div id="shutdown-bar" style="display:none;padding:.4rem 1rem;background:#7f1d1d;
+  color:#fbbf24;font-size:.82rem;text-align:center;flex-shrink:0">
+  <span id="shutdown-msg"></span>
+</div>
+<div id="feed"><div class="empty">Loading messages...</div></div>
+<div id="input-bar">
+  <input id="msg-input" type="text" placeholder="Send a message to agents..." autocomplete="off">
+  <button id="send-btn">Send</button>
+</div>
+<div id="footer">
+  <span id="hub-info"></span>
+  <span style="margin-left:auto"><code>/channels</code> &middot; <code>/channel &lt;name&gt;</code> &middot; <code>/create-channel &lt;name&gt;</code> &middot; <code>/quit [sec]</code></span>
+</div>
+<script>
+const NICK_COLORS=['#38bdf8','#34d399','#fbbf24','#f87171','#c084fc','#fb923c','#2dd4bf','#e879f9'];
+let lastId=0,seeded=false,currentChannel='general';
+
+function $(id){return document.getElementById(id)}
+function esc(s){if(s==null)return'';const d=document.createElement('div');d.textContent=String(s);return d.innerHTML}
+function timeFmt(iso){if(!iso)return'';try{return new Date(iso).toLocaleTimeString()}catch(e){return iso}}
+function nickColor(name){
+  let h=0;for(let i=0;i<name.length;i++)h=((h<<5)-h+name.charCodeAt(i))|0;
+  return NICK_COLORS[Math.abs(h)%NICK_COLORS.length];
+}
+
+function shouldAutoScroll(){
+  const f=$('feed');return f.scrollTop+f.clientHeight>=f.scrollHeight-60;
+}
+
+function appendMessages(msgs){
+  const f=$('feed');
+  const wasEmpty=f.querySelector('.empty');
+  if(wasEmpty)f.innerHTML='';
+  const doScroll=shouldAutoScroll();
+  for(const m of msgs){
+    const div=document.createElement('div');
+    div.className='msg';
+    const isOp=m.from_agent==='operator';
+    const isSys=m.from_agent==='system';
+    if(isOp)div.classList.add('msg-operator');
+    if(isSys)div.classList.add('msg-system');
+    let kindBadge='';
+    if(m.kind&&m.kind!=='chat'){
+      kindBadge='<span class="badge badge-'+esc(m.kind)+'">'+esc(m.kind)+'</span>';
+    }
+    const color=isOp?'#38bdf8':isSys?'#64748b':nickColor(m.from_agent);
+    div.innerHTML='<span class="msg-time">'+timeFmt(m.ts)+'</span>'
+      +'<span class="msg-from" style="color:'+color+'">'+esc(m.from_agent)+'</span>'
+      +kindBadge+esc(m.body);
+    f.appendChild(div);
+    if(m.id>lastId)lastId=m.id;
+  }
+  if(doScroll)f.scrollTop=f.scrollHeight;
+}
+
+function renderAgents(agents){
+  const bar=$('agents-bar');
+  if(!agents.length){bar.innerHTML='';return}
+  bar.innerHTML=agents.map(a=>
+    '<span class="agent-pill"><span class="dot dot-green"></span>'+esc(a.display_name||a.agent_id)+'</span>'
+  ).join('');
+}
+
+async function pollMessages(){
+  try{
+    const url=seeded
+      ?'/v1/messages?channel='+currentChannel+'&since_id='+lastId
+      :'/v1/messages?channel='+currentChannel+'&limit=50';
+    const r=await fetch(url);
+    const j=await r.json();
+    if(j.ok){
+      if(j.result.length)appendMessages(j.result);
+      seeded=true;
+    }
+    $('status-dot').className='dot dot-green';
+    $('status-text').textContent='Connected';
+  }catch(e){
+    $('status-dot').className='dot dot-red';
+    $('status-text').textContent='Disconnected';
+  }
+}
+
+async function pollAgents(){
+  try{
+    const r=await fetch('/v1/agents');
+    const j=await r.json();
+    if(j.ok)renderAgents(j.result);
+  }catch(e){}
+}
+
+async function loadHubInfo(){
+  try{
+    const r=await fetch('/v1/hub-info');
+    const j=await r.json();
+    if(j.ok&&j.result){
+      const i=j.result;
+      $('hub-info').textContent='Instance: '+(i.instance_id||'?')+' | '+(i.wal_mode?'WAL':'no WAL');
+    }
+  }catch(e){}
+}
+
+let shutdownRemaining=null;
+
+function showShutdownBar(sec){
+  const bar=$('shutdown-bar');
+  bar.style.display='';
+  $('shutdown-msg').textContent='Hub shutting down in '+sec+'s\u2026 (type anything to cancel)';
+}
+function hideShutdownBar(){
+  $('shutdown-bar').style.display='none';
+  shutdownRemaining=null;
+}
+function showLocalNotice(text){
+  appendMessages([{from_agent:'system',kind:'notice',body:text,ts:new Date().toISOString(),id:0}]);
+}
+
+async function pollShutdownStatus(){
+  try{
+    const r=await fetch('/v1/shutdown');
+    const j=await r.json();
+    if(j.ok&&j.result){
+      shutdownRemaining=j.result.remaining_sec;
+      showShutdownBar(shutdownRemaining);
+    }else{
+      hideShutdownBar();
+    }
+  }catch(e){}
+}
+
+setInterval(()=>{
+  if(shutdownRemaining!==null&&shutdownRemaining>0){
+    shutdownRemaining--;
+    showShutdownBar(shutdownRemaining);
+  }
+},1000);
+
+async function sendMessage(){
+  const input=$('msg-input');
+  const body=input.value.trim();
+  if(!body)return;
+  input.value='';
+
+  // /channels — list all channels
+  if(/^\/channels$/i.test(body)){
+    try{
+      const r=await fetch('/v1/channels');
+      const j=await r.json();
+      if(j.ok){
+        const names=j.result.map(c=>'#'+c.name).join(', ');
+        showLocalNotice('Channels: '+names);
+      }else{showLocalNotice('Failed to list channels: '+(j.error||'unknown error'));}
+    }catch(e){showLocalNotice('Failed to list channels.');}
+    return;
+  }
+
+  // /channel <name> — switch channel
+  const chMatch=body.match(/^\/channel\s+(\S+)$/i);
+  if(chMatch){
+    const name=chMatch[1].replace(/^#/,'');
+    currentChannel=name;
+    lastId=0;seeded=false;
+    $('feed').innerHTML='<div class="empty">Loading messages...</div>';
+    $('channel-indicator').textContent='#'+name;
+    showLocalNotice('Switched to #'+name);
+    await pollMessages();
+    return;
+  }
+
+  // /create-channel <name> — create and switch to channel
+  const createMatch=body.match(/^\/create-channel\s+(\S+)$/i);
+  if(createMatch){
+    const name=createMatch[1].replace(/^#/,'');
+    try{
+      const r=await fetch('/v1/channels',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name:name,created_by:'operator'})
+      });
+      const j=await r.json();
+      if(j.ok){
+        currentChannel=name;
+        lastId=0;seeded=false;
+        $('feed').innerHTML='<div class="empty">Loading messages...</div>';
+        $('channel-indicator').textContent='#'+name;
+        showLocalNotice('Created and switched to #'+name);
+        await pollMessages();
+      }else{showLocalNotice('Failed to create channel: '+(j.error||'unknown error'));}
+    }catch(e){showLocalNotice('Failed to create channel.');}
+    return;
+  }
+
+  const quitMatch=body.match(/^\/(quit|exit)(?:\s+(\d+))?$/i);
+  if(quitMatch){
+    const delay=quitMatch[2]!==undefined?parseInt(quitMatch[2],10):60;
+    try{
+      const r=await fetch('/v1/shutdown',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({delay_sec:delay})
+      });
+      const j=await r.json();
+      if(!j.ok) showLocalNotice('Shutdown failed: '+j.error);
+      else await pollShutdownStatus();
+    }catch(e){showLocalNotice('Shutdown request failed.');}
+    return;
+  }
+
+  if(shutdownRemaining!==null){
+    try{
+      await fetch('/v1/shutdown/cancel',{
+        method:'POST',headers:{'Content-Type':'application/json'},body:'{}'
+      });
+      hideShutdownBar();
+    }catch(e){}
+  }
+
+  try{
+    await fetch('/v1/messages',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({from_agent:'operator',channel:currentChannel,kind:'chat',body:body})
+    });
+    await pollMessages();
+  }catch(e){
+    input.style.borderColor='#f87171';
+    setTimeout(()=>input.style.borderColor='',1500);
+  }
+}
+
+$('msg-input').addEventListener('keydown',e=>{if(e.key==='Enter')sendMessage()});
+$('send-btn').addEventListener('click',sendMessage);
+
+pollMessages();
+pollAgents();
+loadHubInfo();
+pollShutdownStatus();
+setInterval(pollMessages,3000);
+setInterval(pollAgents,5000);
+setInterval(pollShutdownStatus,5000);
+</script>
+</body>
+</html>"""
+
 def main():
     ap = argparse.ArgumentParser(description="Megahub - single-file agent coordination hub")
     sub = ap.add_subparsers(dest="command")
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--port", type=int, default=6969)
     ap.add_argument("--storage", default="megahub.sqlite3")
     ap.add_argument("--allow-remote", action="store_true")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--spool-dir", default=DEFAULT_SPOOL_DIR)
+    ap.add_argument("--max-body-chars", type=int, default=128_000, help="Maximum characters in a message body")
+    ap.add_argument("--max-attachment-chars", type=int, default=256_000, help="Maximum characters per attachment (JSON-encoded)")
+    ap.add_argument("--max-attachments", type=int, default=32, help="Maximum attachments per message")
 
     ens = sub.add_parser("ensure", help="Start hub if not already running, then exit")
     ens.add_argument("--host", default="127.0.0.1")
-    ens.add_argument("--port", type=int, default=8765)
+    ens.add_argument("--port", type=int, default=6969)
     ens.add_argument("--storage", default="megahub.sqlite3")
     ens.add_argument("--spool-dir", default=DEFAULT_SPOOL_DIR)
     ens.add_argument("--timeout", type=float, default=5.0)
+    ens.add_argument("--max-body-chars", type=int, default=128_000, help="Maximum characters in a message body")
+    ens.add_argument("--max-attachment-chars", type=int, default=256_000, help="Maximum characters per attachment (JSON-encoded)")
+    ens.add_argument("--max-attachments", type=int, default=32, help="Maximum attachments per message")
 
     stp = sub.add_parser("stop", help="Stop a running hub")
     stp.add_argument("--host", default="127.0.0.1")
-    stp.add_argument("--port", type=int, default=8765)
+    stp.add_argument("--port", type=int, default=6969)
     stp.add_argument("--storage", default="megahub.sqlite3")
 
     rst = sub.add_parser("reset", help="Stop the hub and delete the database")
     rst.add_argument("--host", default="127.0.0.1")
-    rst.add_argument("--port", type=int, default=8765)
+    rst.add_argument("--port", type=int, default=6969)
     rst.add_argument("--storage", default="megahub.sqlite3")
 
     relay = sub.add_parser("relay", help="Forward file-spooled relay requests to the local hub")
@@ -1937,7 +2232,9 @@ def main():
 
     a = ap.parse_args()
     if a.command == "ensure":
-        r = ensure_hub(host=a.host, port=a.port, storage=a.storage, timeout=a.timeout, spool_dir=a.spool_dir)
+        r = ensure_hub(host=a.host, port=a.port, storage=a.storage, timeout=a.timeout, spool_dir=a.spool_dir,
+                      max_body_chars=a.max_body_chars, max_attachment_chars=a.max_attachment_chars,
+                      max_attachments=a.max_attachments)
         print(json.dumps(r, indent=2))
         raise SystemExit(0 if r.get("running") else 1)
     if a.command == "stop":
@@ -1983,6 +2280,9 @@ def main():
         storage_path=a.storage,
         allow_remote=a.allow_remote,
         log_events=not a.quiet,
+        max_body_chars=a.max_body_chars,
+        max_attachment_chars=a.max_attachment_chars,
+        max_attachments=a.max_attachments,
     )
     try:
         run_server(cfg, spool_dir=a.spool_dir)

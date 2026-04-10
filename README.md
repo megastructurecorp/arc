@@ -23,7 +23,7 @@ Start the hub (idempotent — safe to run multiple times):
 python megahub.py ensure
 ```
 
-The hub runs in the background on `http://127.0.0.1:8765`. Open that URL in a browser to see the live dashboard.
+The hub runs in the background on `http://127.0.0.1:6969`. Open that URL in a browser to see the live dashboard.
 
 The relay for sandboxed agents starts automatically alongside the hub — no extra commands needed.
 
@@ -56,7 +56,7 @@ python megahub.py ensure
 Default URL:
 
 ```text
-http://127.0.0.1:8765
+http://127.0.0.1:6969
 ```
 
 ### Mode 2: Shared-Filesystem Multi-Hub
@@ -71,7 +71,7 @@ Example:
 
 ```bash
 # Sandbox A
-python megahub.py --port 8765 --storage /shared/megahub.sqlite3
+python megahub.py --port 6969 --storage /shared/megahub.sqlite3
 
 # Sandbox B
 python megahub.py --port 9876 --storage /shared/megahub.sqlite3
@@ -119,7 +119,7 @@ Use this when the agent can call the local hub directly:
 
 > Megahub is available in `megahub.py`.
 > First ensure the hub is running with `python megahub.py ensure`.
-> Then use `http://127.0.0.1:8765`.
+> Then use `http://127.0.0.1:6969`.
 > Register your session, poll for messages, claim work, post artifacts, and release claims when done.
 
 ### Instructions For Isolated Agents Sharing SQLite
@@ -134,18 +134,30 @@ Use this when each sandbox can safely run its own local hub against the same sha
 
 ### Instructions For Constrained Sandboxed Agents
 
-Use this when the sandbox cannot reach host localhost and cannot safely use SQLite on the shared mount:
+Use this when the agent's sandbox cannot reach the host machine's `localhost` or use SQLite on the shared mount.
 
-> Megahub is available in `megahub.py`, but you must use relay transport instead of direct HTTP or direct SQLite.
-> The host is already running:
-> `python megahub.py ensure`
-> Your requests must go through the shared relay spool directory `.megahub-relay`.
-> Do not try to call `http://127.0.0.1:8765` directly unless your sandbox has confirmed localhost access.
+**WARNING: DO NOT start your own hub process!**
+If an agent runs `python megahub.py ensure` inside an isolated sandbox, it will succeed, but they will be talking to an isolated hub and no other agents will see their messages. The host is ALREADY running the real hub.
+
+Provide the agent with this exact prompt:
+
+> You are operating in a constrained sandbox. You cannot communicate via HTTP or direct SQLite, and you MUST NOT start your own Megahub server process. Doing so will isolate you.
+> Instead, interact with the hub exclusively using the file-based relay transport via the `FileRelayClient` class in `megahub.py`.
+> The shared relay spool directory is located at `.megahub-relay`.
+> 
+> Example Python usage:
+> ```python
+> import megahub
+> client = megahub.FileRelayClient(agent_id="my-agent-name", spool_dir=".megahub-relay")
+> client.call("POST", "/v1/sessions", {"agent_id": "my-agent-name", "replace": True})
+> client.call("POST", "/v1/messages", {"channel": "general", "kind": "chat", "body": "hello"})
+> ```
 
 ### Instructions You Should Not Give To Constrained Sandboxes
 
 Do **not** tell a constrained sandboxed agent to:
 
+- run `python megahub.py ensure` (it will create a silent, isolated "party of one")
 - bootstrap by calling host localhost unless you know it can
 - depend on direct SQLite access unless you know the mount supports it
 - follow the normal single-hub bootstrap blindly
@@ -178,11 +190,11 @@ This validates that:
 python megahub.py ensure                # start hub (idempotent)
 python megahub.py stop                  # stop the running hub
 python megahub.py reset                 # stop hub + delete database
-python megahub.py --port 8765           # run hub + relay in foreground
+python megahub.py --port 6969           # run hub + relay in foreground
 python megahub.py smoke-agent --role smoke-b --transport relay --relay-dir .megahub-relay
-curl http://127.0.0.1:8765/v1/hub-info
-curl http://127.0.0.1:8765/v1/threads
-curl "http://127.0.0.1:8765/v1/messages?thread_id=demo-thread"
+curl http://127.0.0.1:6969/v1/hub-info
+curl http://127.0.0.1:6969/v1/threads
+curl "http://127.0.0.1:6969/v1/messages?thread_id=demo-thread"
 ```
 
 ## Protocol Reference

@@ -49,7 +49,7 @@ Megahub is a local-first HTTP + SQLite coordination service for multi-agent syst
 
 Agents interact exclusively via HTTP JSON requests. There is no WebSocket, no long-polling, and no push — agents poll with `since_id` for new messages.
 
-The hub binds to `127.0.0.1:8765` by default. All data persists in a single SQLite file (`megahub.sqlite3`).
+The hub binds to `127.0.0.1:6969` by default. All data persists in a single SQLite file (`megahub.sqlite3`).
 
 ---
 
@@ -87,8 +87,8 @@ The hub binds to `127.0.0.1:8765` by default. All data persists in a single SQLi
 | `to_agent`    | string  | Nullable — if set, message is direct |
 | `channel`     | string  | Defaults to `"general"` or `"direct"` |
 | `kind`        | string  | One of: `chat`, `notice`, `task`, `claim`, `release`, `artifact` |
-| `body`        | string  | Text body (max 16,000 chars)        |
-| `attachments` | array   | List of attachment objects (max 16)  |
+| `body`        | string  | Text body (max 128,000 chars default, configurable) |
+| `attachments` | array   | List of attachment objects (max 32 default, configurable) |
 | `reply_to`    | integer | Nullable — references another `id`  |
 | `thread_id`   | string  | Nullable — groups messages           |
 | `metadata`    | object  | Arbitrary JSON                       |
@@ -247,7 +247,7 @@ All POST endpoints apply these guards before dispatching to the handler:
 - Malformed JSON returns `400`
 - A valid JSON payload must decode to an object, not an array, string, number, or boolean
 
-With default settings, the request-body hard cap is 593,536 bytes.
+With default settings, the request-body hard cap is approximately 8.3 MB. These limits are configurable via `--max-body-chars`, `--max-attachment-chars`, and `--max-attachments` CLI arguments; query `GET /v1/hub-info` for active values.
 
 ### 5.1. `POST /v1/sessions` — Create Session
 
@@ -410,8 +410,8 @@ Returns all sessions with `active = 1` and `last_seen` within `presence_ttl_sec`
 **Validation**:
 - If `to_agent` is null, the channel must exist
 - `kind` must be one of the six valid kinds
-- `body` max 16,000 characters
-- Max 16 attachments, each inline attachment max 32,000 characters (JSON-encoded)
+- `body` max 128,000 characters (default, configurable via `--max-body-chars`)
+- Max 32 attachments (default, configurable via `--max-attachments`), each inline attachment max 256,000 characters JSON-encoded (default, configurable via `--max-attachment-chars`)
 
 ### 5.7. `GET /v1/messages` — Query Messages
 
@@ -914,9 +914,9 @@ The server stores all kinds identically. Semantic enforcement is the responsibil
 
 | Type   | Required fields | Optional      | Size limit                       |
 |--------|-----------------|---------------|----------------------------------|
-| `text` | `content`       | —             | 32,000 chars (JSON-encoded)      |
-| `json` | `content`       | —             | 32,000 chars (JSON-encoded)      |
-| `code` | `content`       | `language`    | 32,000 chars (JSON-encoded)      |
+| `text` | `content`       | —             | 256,000 chars default (JSON-encoded, configurable) |
+| `json` | `content`       | —             | 256,000 chars default (JSON-encoded, configurable) |
+| `code` | `content`       | `language`    | 256,000 chars default (JSON-encoded, configurable) |
 
 ### Reference (pointer to external resource)
 
@@ -1021,7 +1021,7 @@ POST /v1/tasks/3/complete  → done, parent_completed: true (task 1 auto-complet
 When the hub starts, it writes a `.megahub.pid` file in the same directory as the SQLite database:
 
 ```json
-{ "pid": 12345, "port": 8765, "url": "http://127.0.0.1:8765" }
+{ "pid": 12345, "port": 6969, "url": "http://127.0.0.1:6969" }
 ```
 
 On clean shutdown, the PID file is removed (only if the PID and port match, to avoid removing another instance's file).
@@ -1065,7 +1065,7 @@ python megahub_single.py ensure [--host HOST] [--port PORT] [--storage PATH] [--
 
 Returns JSON:
 ```json
-{ "running": true, "started": true, "url": "http://127.0.0.1:8765" }
+{ "running": true, "started": true, "url": "http://127.0.0.1:6969" }
 ```
 
 ---
