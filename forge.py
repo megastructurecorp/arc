@@ -2112,7 +2112,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
 </div>
 <div id="footer">
   <span id="hub-info"></span>
-  <span style="margin-left:auto"><code>/channels</code> &middot; <code>/channel &lt;name&gt;</code> &middot; <code>/create-channel &lt;name&gt;</code> &middot; <code>/quit [sec]</code></span>
+  <span style="margin-left:auto"><code>/channels</code> &middot; <code>/channel &lt;name&gt;</code> &middot; <code>/create-channel &lt;name&gt;</code> &middot; <code>/dm &lt;agent&gt; &lt;msg&gt;</code> &middot; <code>/quit [sec]</code></span>
 </div>
 <script>
 const NICK_COLORS=['#38bdf8','#34d399','#fbbf24','#f87171','#c084fc','#fb923c','#2dd4bf','#e879f9'];
@@ -2274,6 +2274,22 @@ async function sendMessage(){
     return;
   }
 
+  // /dm <agent> <body> — send a direct message to an agent
+  const dmMatch=body.match(/^\/dm\s+(\S+)\s+([\s\S]+)$/i);
+  if(dmMatch){
+    const to=dmMatch[1],dmBody=dmMatch[2];
+    try{
+      const r=await fetch('/v1/messages',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({from_agent:'operator',to_agent:to,channel:'direct',kind:'chat',body:dmBody})
+      });
+      const j=await r.json();
+      if(j.ok)showLocalNotice('DM \u2192 '+to+': '+dmBody);
+      else showLocalNotice('DM failed: '+(j.error||'unknown error'));
+    }catch(e){showLocalNotice('DM failed.');}
+    return;
+  }
+
   // /create-channel <name> — create and switch to channel
   const createMatch=body.match(/^\/create-channel\s+(\S+)$/i);
   if(createMatch){
@@ -2335,6 +2351,13 @@ async function sendMessage(){
 
 $('msg-input').addEventListener('keydown',e=>{if(e.key==='Enter')sendMessage()});
 $('send-btn').addEventListener('click',sendMessage);
+$('inbox-feed').addEventListener('click',e=>{
+  const row=e.target.closest('[data-from]');
+  if(!row)return;
+  const input=$('msg-input');
+  input.value='/dm '+row.dataset.from+' ';
+  input.focus();
+});
 
 async function loadThreads(){
   try{
@@ -2362,6 +2385,9 @@ function renderInbox(msgs){
   for(const m of msgs){
     const div=document.createElement('div');
     div.className='msg msg-operator';
+    div.style.cursor='pointer';
+    div.title='Click to reply with /dm';
+    div.dataset.from=m.from_agent;
     const color=nickColor(m.from_agent);
     div.innerHTML='<span class="msg-time">'+timeFmt(m.ts)+'</span>'
       +'<span class="msg-from" style="color:'+color+'">'+esc(m.from_agent)+' &rarr; you</span>'
