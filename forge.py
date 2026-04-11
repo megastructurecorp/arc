@@ -173,6 +173,14 @@ def _discover_pidfile(storage_path):
 
 _candidate_pidfiles = _pidfile_candidates
 
+class _Conflict(ValueError):
+    """Mutating validation error that must map to HTTP 409 instead of 400."""
+
+class _NotFound(ValueError):
+    """Lookup miss that must map to HTTP 404 instead of 400."""
+
+_ALREADY_SENT = object()  # sentinel returned by handlers that wrote their own response
+
 @dataclass(slots=True)
 class HubConfig:
     listen_host: str = "127.0.0.1"; port: int = 6969; allow_remote: bool = False
@@ -296,7 +304,7 @@ class HubStore:
             act = self._db.execute("SELECT * FROM sessions WHERE agent_id=? AND active=1 ORDER BY created_at DESC LIMIT 1", (agent_id,)).fetchone()
             if act:
                 if _from_iso(act["last_seen"]) >= (now - timedelta(seconds=ttl_sec)) and not replace:
-                    raise ValueError("agent_id already has an active session")
+                    raise _Conflict("agent_id already has an active session")
                 self._db.execute("UPDATE sessions SET active=0 WHERE session_id=?", (act["session_id"],))
                 deact.append(self._ss(act))
             sid, iso = str(uuid.uuid4()), _to_iso(now)
@@ -340,6 +348,17 @@ class HubStore:
         with self._lk:
             return [self._ss(r) for r in self._db.execute("SELECT * FROM sessions WHERE active=1 ORDER BY agent_id").fetchall()]
 
+    def bootstrap(self, agent_id, ttl_sec):
+        """Single-round-trip rehydrate: session, latest visible id, live agents, default channel."""
+        self.prune_expired(ttl_sec)
+        with self._lk:
+            sr = self._db.execute("SELECT * FROM sessions WHERE agent_id=? AND active=1 ORDER BY created_at DESC LIMIT 1", (agent_id,)).fetchone()
+            row = self._db.execute("SELECT COALESCE(MAX(id),0) AS mx FROM messages WHERE to_agent IS NULL OR to_agent=?", (agent_id,)).fetchone()
+            live = [self._ss(r) for r in self._db.execute("SELECT * FROM sessions WHERE active=1 ORDER BY agent_id").fetchall()]
+        return {"agent_id": agent_id, "session": self._ss(sr) if sr else None,
+                "latest_visible_id": int(row["mx"] if row else 0),
+                "live_agents": live, "default_channel": "general"}
+
     def create_message(self, **kw):
         now = _to_iso(_utcnow())
         with self._lk:
@@ -361,7 +380,7 @@ class HubStore:
             return [self._mg(r) for r in self._db.execute(
                 "SELECT * FROM messages WHERE to_agent=? AND id>? ORDER BY id LIMIT ?", (agent_id, since_id, limit)).fetchall()]
 
-    def list_visible_messages_for_agent(self, agent_id, since_id=0, limit=500, *, channel=None, thread_id=None):
+    def list_visible_messages_for_agent(self, agent_id, since_id=0, limit=500, *, channel=None, thread_id=None, exclude_self=False):
         conds = ["id>?", "(to_agent IS NULL OR to_agent=?)"]
         params: list[Any] = [since_id, agent_id]
         if channel is not None:
@@ -370,6 +389,9 @@ class HubStore:
         if thread_id is not None:
             conds.append("thread_id=?")
             params.append(thread_id)
+        if exclude_self:
+            conds.append("from_agent!=?")
+            params.append(agent_id)
         params.append(limit)
         with self._lk:
             rows = self._db.execute(
@@ -662,7 +684,7 @@ ATT_TYPES = {"text","json","code","file_ref","diff_ref"}
 _P = {n: re.compile(p) for n, p in [
     ("sessions", r"^/v1/sessions$"), ("session", r"^/v1/sessions/(?P<id>[^/]+)$"),
     ("agents", r"^/v1/agents$"), ("channels", r"^/v1/channels$"), ("hub_info", r"^/v1/hub-info$"),
-    ("events", r"^/v1/events$"), ("messages", r"^/v1/messages$"),
+    ("events", r"^/v1/events$"), ("messages", r"^/v1/messages$"), ("bootstrap", r"^/v1/bootstrap$"),
     ("threads", r"^/v1/threads$"), ("thread", r"^/v1/threads/(?P<id>[^/]+)$"),
     ("inbox", r"^/v1/inbox/(?P<id>[^/]+)$"),
     ("claims", r"^/v1/claims$"), ("claims_refresh", r"^/v1/claims/refresh$"), ("claims_rel", r"^/v1/claims/release$"),
@@ -762,6 +784,82 @@ def _coerce_int(v, *, name):
 def _max_req(cfg):
     return cfg.max_body_chars + cfg.max_attachment_chars * cfg.max_attachments + 65_536
 
+# ── Route dispatch framework ─────────────────────────────────────────
+# Named validators used by both body-spec validation and per-handler query parsing.
+def _v_ttl(v):
+    if v < 5: raise ValueError("ttl_sec must be at least 5")
+    return v
+def _v_delay(v):
+    if v < 0: raise ValueError("delay_sec must be >= 0")
+    if v > 3600: raise ValueError("delay_sec must be <= 3600")
+    return v
+def _v_status(v):
+    if v not in ("open", "done"): raise ValueError("status must be 'open' or 'done'")
+    return v
+
+def _validate(body, spec):
+    """Coerce body against (name, type, required, validator?) tuples; ValueError on bad input."""
+    out = {}
+    for entry in spec:
+        name, tp, req = entry[0], entry[1], entry[2]
+        val = entry[3] if len(entry) > 3 else None
+        raw = body.get(name)
+        if raw is None:
+            if req: raise ValueError(f"{name} is required")
+            continue
+        if tp is str:
+            v = str(raw).strip()
+            if req and not v: raise ValueError(f"{name} is required")
+            out[name] = v
+        elif tp is int:
+            v = _coerce_int(raw, name=name)
+            out[name] = val(v) if val else v
+        elif tp is dict:
+            if not isinstance(raw, dict): raise ValueError(f"{name} must be a JSON object")
+            out[name] = raw
+        elif tp is list:
+            if not isinstance(raw, list): raise ValueError(f"{name} must be a list")
+            out[name] = raw
+        elif tp is bool:
+            out[name] = bool(raw)
+    return out
+
+# Route table: (method, _P key) -> (handler_name, body_spec_or_None, touch_field_or_None).
+# body_spec is a tuple of (name, type, required, validator?) tuples consumed by _validate.
+# None means the handler owns its own parsing (GET queries, orchestration-heavy POSTs).
+_S_SESSIONS   = (("agent_id",str,True),("display_name",str,False),("capabilities",list,False),("metadata",dict,False),("replace",bool,False))
+_S_CHANNELS   = (("name",str,True),("created_by",str,False),("metadata",dict,False))
+_S_CLAIMS     = (("owner_agent_id",str,True),("claim_key",str,False),("task_message_id",int,False),("thread_id",str,False),("ttl_sec",int,False,_v_ttl),("metadata",dict,False))
+_S_CLAIMS_RFR = (("claim_key",str,True),("owner_agent_id",str,True),("ttl_sec",int,False,_v_ttl))
+_S_CLAIMS_REL = (("claim_key",str,True),("agent_id",str,True))
+_S_LOCKS      = (("agent_id",str,True),("file_path",str,True),("ttl_sec",int,False,_v_ttl),("metadata",dict,False))
+_S_LOCKS_RFR  = (("agent_id",str,True),("file_path",str,True),("ttl_sec",int,False,_v_ttl))
+_S_LOCKS_REL  = (("agent_id",str,True),("file_path",str,True))
+_S_SHUTDOWN   = (("delay_sec",int,False,_v_delay),)
+
+_ROUTES = {
+    ("GET","root"):("_h_root",None,None),             ("GET","agents"):("_h_agents",None,None),
+    ("GET","channels"):("_h_channels",None,None),     ("GET","hub_info"):("_h_hub_info",None,None),
+    ("GET","events"):("_h_events",None,None),         ("GET","messages"):("_h_messages",None,None),
+    ("GET","threads"):("_h_threads",None,None),       ("GET","thread"):("_h_thread",None,None),
+    ("GET","inbox"):("_h_inbox",None,None),           ("GET","claims"):("_h_list_claims",None,None),
+    ("GET","locks"):("_h_list_locks",None,None),      ("GET","tasks"):("_h_list_tasks",None,None),
+    ("GET","shutdown"):("_h_shutdown_status",None,None),
+    ("GET","bootstrap"):("_h_bootstrap",None,None),
+    ("POST","sessions"):("_h_create_session",_S_SESSIONS,None),
+    ("POST","channels"):("_h_create_channel",_S_CHANNELS,None),
+    ("POST","messages"):("_h_post_message",None,None),
+    ("POST","claims"):("_h_acquire_claim",_S_CLAIMS,"owner_agent_id"),
+    ("POST","claims_refresh"):("_h_refresh_claim",_S_CLAIMS_RFR,"owner_agent_id"),
+    ("POST","claims_rel"):("_h_release_claim",_S_CLAIMS_REL,"agent_id"),
+    ("POST","locks"):("_h_acquire_lock",_S_LOCKS,"agent_id"),
+    ("POST","locks_refresh"):("_h_refresh_lock",_S_LOCKS_RFR,"agent_id"),
+    ("POST","locks_rel"):("_h_release_lock",_S_LOCKS_REL,"agent_id"),
+    ("POST","task_complete"):("_h_task_complete",None,None),
+    ("POST","shutdown"):("_h_shutdown_initiate",_S_SHUTDOWN,None),
+    ("POST","shutdown_cancel"):("_h_shutdown_cancel",None,None),
+}
+
 class _H(BaseHTTPRequestHandler):
     server: _Srv
     def log_message(self, *a): pass
@@ -805,246 +903,167 @@ class _H(BaseHTTPRequestHandler):
         self.send_header("X-Forge-Instance", self.server.instance_id)
         self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
 
-    def do_GET(self):
-        path, q = self._u(); s = self.server.store; cfg = self.server.cfg
-        if _P["root"].match(path): return self._html(DASHBOARD_HTML)
-        if _P["agents"].match(path): return self._ok({"ok":True,"result":s.list_live_agents(cfg.presence_ttl_sec)})
-        if _P["channels"].match(path): return self._ok({"ok":True,"result":s.list_channels()})
-        if _P["hub_info"].match(path):
-            return self._ok({"ok":True,"result":{
-                "storage_path": str(self.server.store.db_path),
-                "instance_id": self.server.instance_id,
-                "journal_mode": self.server.store.journal_mode,
-                "wal_mode": self.server.store.wal_enabled,
-                "default_channel": "general",
-                "max_body_chars": cfg.max_body_chars,
-                "max_attachment_chars": cfg.max_attachment_chars,
-                "max_attachments": cfg.max_attachments,
-            }})
-        if _P["events"].match(path):
-            aid = q.get("agent_id", [None])[0]
-            ch = q.get("channel", [None])[0]
-            tid = q.get("thread_id", [None])[0]
-            if not aid: return self._err("agent_id query parameter is required")
-            if ch and s.get_channel(ch) is None: return self._err("channel not found", 404)
+    # ── Dispatch ──────────────────────────────────────────────────────
+    def _dispatch(self, method):
+        path, q = self._u()
+        for (mth, key), (fn, spec, touch) in _ROUTES.items():
+            if mth != method: continue
+            mt = _P[key].match(path)
+            if not mt: continue
             try:
-                si = _parse_since_id(q)
-                li = _parse_limit(q, cfg.max_query_limit)
-                to = _parse_timeout(q)
-            except ValueError as e: return self._err(str(e))
-            msgs = _poll_until(lambda: s.list_visible_messages_for_agent(aid, since_id=si, limit=li, channel=ch, thread_id=tid), to)
-            return self._ok({"ok":True,"result":msgs})
-        if _P["messages"].match(path):
-            ch, tid = q.get("channel",[None])[0], q.get("thread_id",[None])[0]
-            if not ch and not tid: return self._err("channel or thread_id query parameter is required")
-            if ch and s.get_channel(ch) is None: return self._err("channel not found", 404)
-            try:
-                si = _parse_since_id(q)
-                li = _parse_limit(q, cfg.max_query_limit)
-                to = _parse_timeout(q)
-            except ValueError as e: return self._err(str(e))
-            msgs = _poll_until(lambda: s.list_thread_messages(tid,channel=ch,since_id=si,limit=li) if tid else s.list_channel_messages(ch,since_id=si,limit=li), to)
-            return self._ok({"ok":True,"result":msgs})
-        if _P["threads"].match(path):
-            return self._ok({"ok":True,"result":s.list_threads()})
-        m = _P["thread"].match(path)
-        if m:
-            detail = s.get_thread_detail(m.group("id"))
-            if detail is None: return self._err("thread not found", 404)
-            return self._ok({"ok":True,"result":detail})
-        m = _P["inbox"].match(path)
-        if m:
-            try:
-                si = _parse_since_id(q)
-                li = _parse_limit(q, cfg.max_query_limit)
-            except ValueError as e: return self._err(str(e))
-            return self._ok({"ok":True,"result":s.list_inbox_messages(m.group("id"),since_id=si,limit=li)})
-        if _P["claims"].match(path):
-            tid = q.get("thread_id",[None])[0]; ao = q.get("active_only",[""])[0].lower() in ("true","1","yes")
-            return self._ok({"ok":True,"result":s.list_claims(thread_id=tid,active_only=ao)})
-        if _P["locks"].match(path):
-            aid = q.get("agent_id",[None])[0]; ao = q.get("active_only",[""])[0].lower() in ("true","1","yes")
-            return self._ok({"ok":True,"result":s.list_locks(agent_id=aid,active_only=ao)})
-        if _P["tasks"].match(path):
-            pid_raw = q.get("parent_id",[None])[0]; st = q.get("status",[None])[0]; ch = q.get("channel",[None])[0]; tid = q.get("thread_id",[None])[0]
-            pid = None
-            if pid_raw is not None:
-                try: pid = _coerce_int(pid_raw, name="parent_id")
-                except ValueError as e: return self._err(str(e))
-            if st is not None and st not in ("open","done"): return self._err("status must be 'open' or 'done'")
-            return self._ok({"ok":True,"result":s.list_tasks(parent_id=pid,status=st,channel=ch,thread_id=tid)})
-        if _P["shutdown"].match(path):
-            status = self.server.get_shutdown_status()
-            return self._ok({"ok":True,"result":status})
+                body, params = None, {}
+                if method == "POST":
+                    body = self._j()
+                    if spec is not None: params = _validate(body, spec)
+                result = getattr(self, fn)(params, mt, q, body)
+            except _Conflict as e:  return self._err(str(e), 409)
+            except _NotFound as e:  return self._err(str(e), 404)
+            except ValueError as e: return self._err(str(e), 400)
+            if result is _ALREADY_SENT: return
+            payload, status = result if isinstance(result, tuple) else (result, 200)
+            if touch and body and body.get(touch):
+                self.server.store.touch_agent_session(str(body[touch]).strip())
+            return self._ok(payload, status)
+        if method == "POST":  # drain body so a bad path doesn't hang the keep-alive
+            try: n = int(self.headers.get("Content-Length", "0"))
+            except (TypeError, ValueError): n = 0
+            if n > 0: self._discard_body(n, limit=n)
         self._err("not found", 404)
 
-    def do_POST(self):
-        path, _ = self._u(); s = self.server.store; cfg = self.server.cfg
-        if _P["sessions"].match(path):
-            try:
-                p = self._j(); aid = str(p.get("agent_id","")).strip()
-                if not aid: raise ValueError("agent_id is required")
-                caps = p.get("capabilities") or []
-                if not isinstance(caps, list): raise ValueError("capabilities must be a list")
-                meta = p.get("metadata") or {}
-                if not isinstance(meta, dict): raise ValueError("metadata must be a JSON object")
-                sess, _ = s.create_session(aid, p.get("display_name"), [str(c) for c in caps], meta, bool(p.get("replace",False)), cfg.presence_ttl_sec)
-            except ValueError as e:
-                return self._err(str(e), 409 if "already has an active" in str(e) else 400)
-            return self._ok({"ok":True,"result":sess}, 201)
-        if _P["channels"].match(path):
-            try:
-                p = self._j(); name = str(p.get("name","")).strip()
-                if not name: raise ValueError("name is required")
-                cb = p.get("created_by"); cb = str(cb) if cb is not None else None
-                meta = p.get("metadata") or {}
-                if not isinstance(meta, dict): raise ValueError("metadata must be a JSON object")
-                ch, created = s.create_channel(name, cb, meta)
-            except ValueError as e: return self._err(str(e))
-            return self._ok({"ok":True,"result":ch}, 201 if created else 200)
-        if _P["messages"].match(path):
-            try:
-                raw = self._j()
-                ptid = raw.pop("parent_task_id", None)
-                if ptid is not None: ptid = _coerce_int(ptid, name="parent_task_id")
-                n = _norm_msg(raw, cfg)
-                if n["to_agent"] is None and s.get_channel(n["channel"]) is None:
-                    raise ValueError(f"channel does not exist: {n['channel']}")
-                msg = s.create_message(**n)
-            except ValueError as e: return self._err(str(e))
-            if msg["kind"] == "task":
-                s.create_task(message_id=msg["id"],parent_task_id=ptid,channel=msg["channel"],thread_id=msg["thread_id"])
-            s.touch_agent_session(msg["from_agent"])
-            return self._ok({"ok":True,"result":msg}, 201)
-        if _P["claims_rel"].match(path):
-            try:
-                p = self._j(); ck = str(p.get("claim_key","")).strip(); aid = str(p.get("agent_id","")).strip()
-                if not ck: raise ValueError("claim_key is required")
-                if not aid: raise ValueError("agent_id is required")
-            except ValueError as e: return self._err(str(e))
-            cl = s.release_claim(ck, aid)
-            if cl is None: return self._err("claim not found or not owned by agent_id", 404)
-            s.touch_agent_session(aid)
-            return self._ok({"ok":True,"result":cl})
-        if _P["claims_refresh"].match(path):
-            try:
-                p = self._j(); ck = str(p.get("claim_key","")).strip(); oid = str(p.get("owner_agent_id","")).strip()
-                if not ck: raise ValueError("claim_key is required")
-                if not oid: raise ValueError("owner_agent_id is required")
-                ttl = _coerce_int(p.get("ttl_sec",300), name="ttl_sec")
-                if ttl < 5: raise ValueError("ttl_sec must be at least 5")
-            except ValueError as e: return self._err(str(e))
-            cl = s.refresh_claim(ck, oid, ttl_sec=ttl)
-            if cl is None: return self._err("claim not found or not owned by owner_agent_id", 404)
-            s.touch_agent_session(oid)
-            return self._ok({"ok":True,"acquired":True,"result":cl})
-        if _P["locks_rel"].match(path):
-            try:
-                p = self._j(); fp = str(p.get("file_path","")).strip(); aid = str(p.get("agent_id","")).strip()
-                if not fp: raise ValueError("file_path is required")
-                if not aid: raise ValueError("agent_id is required")
-            except ValueError as e: return self._err(str(e))
-            lk = s.release_lock(fp, aid)
-            if lk is None: return self._err("lock not found or not owned by agent_id", 404)
-            s.touch_agent_session(aid)
-            return self._ok({"ok":True,"result":lk})
-        if _P["locks_refresh"].match(path):
-            try:
-                p = self._j(); fp = str(p.get("file_path","")).strip(); aid = str(p.get("agent_id","")).strip()
-                if not fp: raise ValueError("file_path is required")
-                if not aid: raise ValueError("agent_id is required")
-                ttl = _coerce_int(p.get("ttl_sec",300), name="ttl_sec")
-                if ttl < 5: raise ValueError("ttl_sec must be at least 5")
-            except ValueError as e: return self._err(str(e))
-            lk = s.refresh_lock(fp, aid, ttl_sec=ttl)
-            if lk is None: return self._err("lock not found or not owned by agent_id", 404)
-            s.touch_agent_session(aid)
-            return self._ok({"ok":True,"acquired":True,"result":lk})
-        if _P["locks"].match(path):
-            try:
-                p = self._j(); aid = str(p.get("agent_id","")).strip()
-                if not aid: raise ValueError("agent_id is required")
-                fp = str(p.get("file_path","")).strip()
-                if not fp: raise ValueError("file_path is required")
-                ttl = _coerce_int(p.get("ttl_sec",300), name="ttl_sec")
-                if ttl < 5: raise ValueError("ttl_sec must be at least 5")
-                meta = p.get("metadata") or {}
-                if not isinstance(meta, dict): raise ValueError("metadata must be a JSON object")
-                lk, acq = s.acquire_lock(file_path=fp,agent_id=aid,ttl_sec=ttl,metadata=meta)
-            except ValueError as e: return self._err(str(e))
-            s.touch_agent_session(aid)
-            return self._ok({"ok":True,"acquired":acq,"result":lk}, 201 if acq else 200)
-        if _P["claims"].match(path):
-            try:
-                p = self._j(); oid = str(p.get("owner_agent_id","")).strip()
-                if not oid: raise ValueError("owner_agent_id is required")
-                ck, tmid = p.get("claim_key"), p.get("task_message_id")
-                if tmid is not None: tmid = _coerce_int(tmid, name="task_message_id")
-                if ck is not None: ck = str(ck).strip()
-                if not ck:
-                    if tmid is not None: ck = f"task-{tmid}"
-                    else: raise ValueError("claim_key or task_message_id is required")
-                tid = p.get("thread_id"); tid = (str(tid).strip() or None) if tid is not None else None
-                ttl = _coerce_int(p.get("ttl_sec",300), name="ttl_sec")
-                if ttl < 5: raise ValueError("ttl_sec must be at least 5")
-                meta = p.get("metadata") or {}
-                if not isinstance(meta, dict): raise ValueError("metadata must be a JSON object")
-                cl, acq = s.acquire_claim(claim_key=ck,thread_id=tid,task_message_id=tmid,owner_agent_id=oid,ttl_sec=ttl,metadata=meta)
-            except ValueError as e: return self._err(str(e))
-            s.touch_agent_session(oid)
-            return self._ok({"ok":True,"acquired":acq,"result":cl}, 201 if acq else 200)
-        m = _P["task_complete"].match(path)
-        if m:
-            tid = int(m.group("id"))
-            t = s.complete_task(tid)
-            if t is None: return self._err("task not found", 404)
-            result = {"ok":True,"result":t}
-            done = s.check_parent_completion(tid)
-            if done is True and t["parent_task_id"] is not None:
-                parent = s.get_task(t["parent_task_id"])
-                if parent and parent["status"] == "open":
-                    s.complete_task(t["parent_task_id"])
-                    subs = s.list_tasks(parent_id=t["parent_task_id"])
-                    s.create_message(from_agent="system",to_agent=None,channel=parent["channel"],
-                        kind="notice",body=f"All {len(subs)} subtasks of task {t['parent_task_id']} are complete.",
-                        attachments=[],reply_to=t["parent_task_id"],thread_id=parent["thread_id"],
-                        metadata={"auto_rollup":True,"parent_task_id":t["parent_task_id"]})
-                    result["parent_completed"] = True
-            return self._ok(result)
-        if _P["shutdown_cancel"].match(path):
-            try:
-                self._j()
-                self.server.cancel_shutdown()
-            except ValueError as e:
-                return self._err(str(e))
-            return self._ok({"ok":True,"result":{"status":"shutdown_cancelled"}})
-        if _P["shutdown"].match(path):
-            try:
-                p = self._j()
-                delay = int(p.get("delay_sec", 60))
-                if delay < 0: raise ValueError("delay_sec must be >= 0")
-                if delay > 3600: raise ValueError("delay_sec must be <= 3600")
-                self.server.initiate_shutdown(delay)
-            except ValueError as e:
-                return self._err(str(e))
-            status = self.server.get_shutdown_status()
-            return self._ok({"ok":True,"result":{"status":"shutdown_initiated",**(status or {})}})
-        try:
-            raw = self.headers.get("Content-Length", "0")
-            n = int(raw)
-        except (TypeError, ValueError):
-            n = 0
-        if n > 0:
-            self._discard_body(n, limit=n)
-        self._err("not found", 404)
-
+    def do_GET(self):    self._dispatch("GET")
+    def do_POST(self):   self._dispatch("POST")
     def do_DELETE(self):
-        path, _ = self._u(); m = _P["session"].match(path)
-        if m:
-            sess = self.server.store.delete_session(m.group("id"))
-            if not sess: return self._err("session not found", 404)
-            return self._ok({"ok":True,"result":{"session_id":m.group("id"),"deleted":True}})
-        self._err("not found", 404)
+        mt = _P["session"].match(self._u()[0])
+        if not mt: return self._err("not found", 404)
+        sess = self.server.store.delete_session(mt.group("id"))
+        if not sess: return self._err("session not found", 404)
+        return self._ok({"ok":True,"result":{"session_id":mt.group("id"),"deleted":True}})
+
+    # ── GET handlers ──────────────────────────────────────────────────
+    def _h_root(self, p, m, q, b):     self._html(DASHBOARD_HTML); return _ALREADY_SENT
+    def _h_agents(self, p, m, q, b):   return {"ok":True,"result":self.server.store.list_live_agents(self.server.cfg.presence_ttl_sec)}
+    def _h_channels(self, p, m, q, b): return {"ok":True,"result":self.server.store.list_channels()}
+    def _h_threads(self, p, m, q, b):  return {"ok":True,"result":self.server.store.list_threads()}
+    def _h_shutdown_status(self, p, m, q, b): return {"ok":True,"result":self.server.get_shutdown_status()}
+    def _h_bootstrap(self, p, m, q, b):
+        aid = q.get("agent_id",[None])[0]
+        if not aid: raise ValueError("agent_id query parameter is required")
+        return {"ok":True,"result":self.server.store.bootstrap(aid, self.server.cfg.presence_ttl_sec)}
+    def _h_hub_info(self, p, m, q, b):
+        cfg = self.server.cfg; s = self.server.store
+        return {"ok":True,"result":{"storage_path":str(s.db_path),"instance_id":self.server.instance_id,
+            "journal_mode":s.journal_mode,"wal_mode":s.wal_enabled,"default_channel":"general",
+            "max_body_chars":cfg.max_body_chars,"max_attachment_chars":cfg.max_attachment_chars,
+            "max_attachments":cfg.max_attachments}}
+    def _h_events(self, p, m, q, b):
+        s = self.server.store; cfg = self.server.cfg
+        aid = q.get("agent_id",[None])[0]; ch = q.get("channel",[None])[0]; tid = q.get("thread_id",[None])[0]
+        if not aid: raise ValueError("agent_id query parameter is required")
+        if ch and s.get_channel(ch) is None: raise _NotFound("channel not found")
+        ex = q.get("exclude_self",[""])[0].lower() in ("true","1","yes")
+        si = _parse_since_id(q); li = _parse_limit(q, cfg.max_query_limit); to = _parse_timeout(q)
+        return {"ok":True,"result":_poll_until(lambda: s.list_visible_messages_for_agent(aid, since_id=si, limit=li, channel=ch, thread_id=tid, exclude_self=ex), to)}
+    def _h_messages(self, p, m, q, b):
+        s = self.server.store; cfg = self.server.cfg
+        ch = q.get("channel",[None])[0]; tid = q.get("thread_id",[None])[0]
+        if not ch and not tid: raise ValueError("channel or thread_id query parameter is required")
+        if ch and s.get_channel(ch) is None: raise _NotFound("channel not found")
+        si = _parse_since_id(q); li = _parse_limit(q, cfg.max_query_limit); to = _parse_timeout(q)
+        return {"ok":True,"result":_poll_until(lambda: s.list_thread_messages(tid,channel=ch,since_id=si,limit=li) if tid else s.list_channel_messages(ch,since_id=si,limit=li), to)}
+    def _h_thread(self, p, m, q, b):
+        d = self.server.store.get_thread_detail(m.group("id"))
+        if d is None: raise _NotFound("thread not found")
+        return {"ok":True,"result":d}
+    def _h_inbox(self, p, m, q, b):
+        si = _parse_since_id(q); li = _parse_limit(q, self.server.cfg.max_query_limit)
+        return {"ok":True,"result":self.server.store.list_inbox_messages(m.group("id"),since_id=si,limit=li)}
+    def _h_list_claims(self, p, m, q, b):
+        ao = q.get("active_only",[""])[0].lower() in ("true","1","yes")
+        return {"ok":True,"result":self.server.store.list_claims(thread_id=q.get("thread_id",[None])[0],active_only=ao)}
+    def _h_list_locks(self, p, m, q, b):
+        ao = q.get("active_only",[""])[0].lower() in ("true","1","yes")
+        return {"ok":True,"result":self.server.store.list_locks(agent_id=q.get("agent_id",[None])[0],active_only=ao)}
+    def _h_list_tasks(self, p, m, q, b):
+        pid_raw = q.get("parent_id",[None])[0]; st = q.get("status",[None])[0]
+        pid = _coerce_int(pid_raw, name="parent_id") if pid_raw is not None else None
+        if st is not None: _v_status(st)
+        return {"ok":True,"result":self.server.store.list_tasks(parent_id=pid,status=st,channel=q.get("channel",[None])[0],thread_id=q.get("thread_id",[None])[0])}
+
+    # ── POST handlers ─────────────────────────────────────────────────
+    def _h_create_session(self, p, m, q, b):
+        s = self.server.store
+        sess, _ = s.create_session(p["agent_id"], p.get("display_name"),
+            [str(c) for c in p.get("capabilities",[])], p.get("metadata",{}),
+            bool(p.get("replace",False)), self.server.cfg.presence_ttl_sec)
+        return ({"ok":True,"result":sess}, 201)
+    def _h_create_channel(self, p, m, q, b):
+        ch, created = self.server.store.create_channel(p["name"], p.get("created_by"), p.get("metadata",{}))
+        return ({"ok":True,"result":ch}, 201 if created else 200)
+    def _h_post_message(self, p, m, q, b):
+        s = self.server.store; raw = dict(b)
+        ptid = raw.pop("parent_task_id", None)
+        if ptid is not None:
+            ptid = _coerce_int(ptid, name="parent_task_id")
+            if s.get_task(ptid) is None: raise ValueError("parent_task_id references unknown task")
+        n = _norm_msg(raw, self.server.cfg)
+        if n["to_agent"] is None and s.get_channel(n["channel"]) is None:
+            raise ValueError(f"channel does not exist: {n['channel']}")
+        msg = s.create_message(**n)
+        if msg["kind"] == "task":
+            s.create_task(message_id=msg["id"], parent_task_id=ptid, channel=msg["channel"], thread_id=msg["thread_id"])
+        s.touch_agent_session(msg["from_agent"])
+        return ({"ok":True,"result":msg}, 201)
+    def _h_acquire_claim(self, p, m, q, b):
+        ck = p.get("claim_key") or None; tmid = p.get("task_message_id")
+        if not ck:
+            if tmid is None: raise ValueError("claim_key or task_message_id is required")
+            ck = f"task-{tmid}"
+        cl, acq = self.server.store.acquire_claim(claim_key=ck, thread_id=p.get("thread_id") or None,
+            task_message_id=tmid, owner_agent_id=p["owner_agent_id"],
+            ttl_sec=p.get("ttl_sec",300), metadata=p.get("metadata",{}))
+        return ({"ok":True,"acquired":acq,"result":cl}, 201 if acq else 200)
+    def _h_refresh_claim(self, p, m, q, b):
+        cl = self.server.store.refresh_claim(p["claim_key"], p["owner_agent_id"], ttl_sec=p.get("ttl_sec",300))
+        if cl is None: raise _NotFound("claim not found or not owned by owner_agent_id")
+        return {"ok":True,"acquired":True,"result":cl}
+    def _h_release_claim(self, p, m, q, b):
+        cl = self.server.store.release_claim(p["claim_key"], p["agent_id"])
+        if cl is None: raise _NotFound("claim not found or not owned by agent_id")
+        return {"ok":True,"result":cl}
+    def _h_acquire_lock(self, p, m, q, b):
+        lk, acq = self.server.store.acquire_lock(file_path=p["file_path"], agent_id=p["agent_id"],
+            ttl_sec=p.get("ttl_sec",300), metadata=p.get("metadata",{}))
+        return ({"ok":True,"acquired":acq,"result":lk}, 201 if acq else 200)
+    def _h_refresh_lock(self, p, m, q, b):
+        lk = self.server.store.refresh_lock(p["file_path"], p["agent_id"], ttl_sec=p.get("ttl_sec",300))
+        if lk is None: raise _NotFound("lock not found or not owned by agent_id")
+        return {"ok":True,"acquired":True,"result":lk}
+    def _h_release_lock(self, p, m, q, b):
+        lk = self.server.store.release_lock(p["file_path"], p["agent_id"])
+        if lk is None: raise _NotFound("lock not found or not owned by agent_id")
+        return {"ok":True,"result":lk}
+    def _h_task_complete(self, p, m, q, b):
+        s = self.server.store; tid = int(m.group("id"))
+        t = s.complete_task(tid)
+        if t is None: raise _NotFound("task not found")
+        result = {"ok":True,"result":t}
+        if s.check_parent_completion(tid) is True and t["parent_task_id"] is not None:
+            parent = s.get_task(t["parent_task_id"])
+            if parent and parent["status"] == "open":
+                s.complete_task(t["parent_task_id"])
+                subs = s.list_tasks(parent_id=t["parent_task_id"])
+                s.create_message(from_agent="system", to_agent=None, channel=parent["channel"],
+                    kind="notice", body=f"All {len(subs)} subtasks of task {t['parent_task_id']} are complete.",
+                    attachments=[], reply_to=t["parent_task_id"], thread_id=parent["thread_id"],
+                    metadata={"auto_rollup":True,"parent_task_id":t["parent_task_id"]})
+                result["parent_completed"] = True
+        return result
+    def _h_shutdown_initiate(self, p, m, q, b):
+        self.server.initiate_shutdown(p.get("delay_sec", 60))
+        return {"ok":True,"result":{"status":"shutdown_initiated",**(self.server.get_shutdown_status() or {})}}
+    def _h_shutdown_cancel(self, p, m, q, b):
+        self.server.cancel_shutdown()
+        return {"ok":True,"result":{"status":"shutdown_cancelled"}}
 
 class _Srv(ThreadingMixIn, HTTPServer):
     daemon_threads = True
@@ -1572,6 +1591,142 @@ class FileRelayClient:
         return _error_response(request_id, 598, "relay timed out waiting for response")
 
 
+class ForgeError(Exception):
+    """Raised by ForgeClient when the hub returns an !ok envelope."""
+    def __init__(self, error: str, status: int = 400):
+        super().__init__(error)
+        self.error = error
+        self.status = status
+
+class _HTTPTransport:
+    """Direct HTTP transport for ForgeClient (urllib.request under the hood)."""
+    def __init__(self, base_url: str, timeout: float):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+    def call(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return _http_json(self.base_url, method, path, payload, timeout=self.timeout)
+
+class _RelayTransport:
+    """File-spooled transport for sandboxed agents that cannot reach host localhost.
+    Wraps FileRelayClient and unwraps its envelope so callers see the hub envelope directly.
+
+    The relay envelope nests the hub's response under `body`. A hub 4xx is still a
+    successful transport — we return the hub envelope as-is and let ForgeClient._call
+    raise ForgeError on !ok. A transport-level failure (timeout, spool error, malformed
+    envelope) has no `body` — we synthesize an error envelope from the top-level fields.
+    """
+    def __init__(self, relay_client: "FileRelayClient"):
+        self._rc = relay_client
+    def call(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        r = self._rc.call(method, path, payload)
+        body = r.get("body")
+        if isinstance(body, dict): return body
+        return {"ok": False, "error": r.get("error") or "relay transport error"}
+
+class ForgeClient:
+    """Client for the Forge hub. Tracks since_id internally so poll() is idempotent.
+
+    Two ways to construct:
+      ForgeClient(agent_id, base_url=...)            # direct HTTP (default)
+      ForgeClient.over_relay(agent_id, spool_dir=...) # file-spooled relay (sandboxed)
+
+    Construct once per agent process. `exclude_self=True` is the default on poll() —
+    callers that want their own posts echoed back must pass exclude_self=False.
+    """
+    def __init__(self, agent_id: str, base_url: str = DEFAULT_BASE_URL, timeout: float = 15.0,
+                 *, transport: Any = None):
+        self.agent_id = agent_id
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self._transport = transport if transport is not None else _HTTPTransport(self.base_url, timeout)
+        self._since_id = 0
+
+    @classmethod
+    def over_relay(cls, agent_id: str, spool_dir: str = DEFAULT_SPOOL_DIR, *, timeout: float = 30.0) -> "ForgeClient":
+        """Construct a ForgeClient that talks to the hub via the file-spool relay.
+        Use this in sandboxes that cannot reach 127.0.0.1 and cannot safely use SQLite
+        on the shared mount. The host must already be running `python forge.py ensure`."""
+        rc = FileRelayClient(agent_id=agent_id, spool_dir=spool_dir, timeout=timeout)
+        return cls(agent_id, timeout=timeout, transport=_RelayTransport(rc))
+
+    def _call(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        resp = self._transport.call(method, path, payload)
+        if not resp.get("ok"): raise ForgeError(resp.get("error", "unknown error"))
+        return resp
+
+    def register(self, *, display_name=None, replace=True, capabilities=None, metadata=None) -> dict:
+        body: dict[str, Any] = {"agent_id": self.agent_id, "replace": bool(replace)}
+        if display_name is not None: body["display_name"] = display_name
+        if capabilities is not None: body["capabilities"] = list(capabilities)
+        if metadata is not None: body["metadata"] = dict(metadata)
+        return self._call("POST", "/v1/sessions", body)["result"]
+
+    def post(self, channel: str, body: str, *, kind: str = "chat", thread_id: str | None = None,
+             to_agent: str | None = None, attachments: list | None = None,
+             metadata: dict | None = None, reply_to: int | None = None,
+             parent_task_id: int | None = None) -> dict:
+        p: dict[str, Any] = {"from_agent": self.agent_id, "channel": channel, "kind": kind, "body": body}
+        if thread_id is not None:    p["thread_id"] = thread_id
+        if to_agent is not None:     p["to_agent"] = to_agent
+        if attachments is not None:  p["attachments"] = attachments
+        if metadata is not None:     p["metadata"] = metadata
+        if reply_to is not None:     p["reply_to"] = reply_to
+        if parent_task_id is not None: p["parent_task_id"] = parent_task_id
+        return self._call("POST", "/v1/messages", p)["result"]
+
+    def dm(self, to_agent: str, body: str, **kw) -> dict:
+        kw.setdefault("channel", "direct")
+        return self.post(body=body, to_agent=to_agent, **kw)
+
+    def poll(self, *, exclude_self: bool = True, timeout: float = 30.0,
+             channel: str | None = None, thread_id: str | None = None, limit: int = 100) -> list[dict]:
+        """Long-poll /v1/events; advances internal since_id on return. Returns new messages only."""
+        q: dict[str, Any] = {"agent_id": self.agent_id, "since_id": self._since_id,
+                             "timeout": timeout, "limit": limit}
+        if exclude_self: q["exclude_self"] = 1
+        if channel is not None:   q["channel"] = channel
+        if thread_id is not None: q["thread_id"] = thread_id
+        path = "/v1/events?" + urllib.parse.urlencode(q)
+        msgs = self._call("GET", path)["result"]
+        if msgs: self._since_id = max(m["id"] for m in msgs)
+        return msgs
+
+    def bootstrap(self) -> dict:
+        r = self._call("GET", f"/v1/bootstrap?agent_id={urllib.parse.quote(self.agent_id)}")["result"]
+        self._since_id = max(self._since_id, int(r.get("latest_visible_id", 0)))
+        return r
+
+    def whoami(self) -> dict: return self.bootstrap()
+
+    def claim(self, claim_key: str, *, thread_id: str | None = None,
+              task_message_id: int | None = None, ttl_sec: int = 300, metadata: dict | None = None) -> dict:
+        p: dict[str, Any] = {"owner_agent_id": self.agent_id, "claim_key": claim_key, "ttl_sec": ttl_sec}
+        if thread_id is not None:       p["thread_id"] = thread_id
+        if task_message_id is not None: p["task_message_id"] = task_message_id
+        if metadata is not None:        p["metadata"] = metadata
+        return self._call("POST", "/v1/claims", p)["result"]
+
+    def refresh_claim(self, claim_key: str, ttl_sec: int = 300) -> dict:
+        return self._call("POST", "/v1/claims/refresh",
+            {"claim_key": claim_key, "owner_agent_id": self.agent_id, "ttl_sec": ttl_sec})["result"]
+
+    def release(self, claim_key: str) -> dict:
+        return self._call("POST", "/v1/claims/release",
+            {"claim_key": claim_key, "agent_id": self.agent_id})["result"]
+
+    def lock(self, file_path: str, ttl_sec: int = 300, metadata: dict | None = None) -> dict:
+        p: dict[str, Any] = {"agent_id": self.agent_id, "file_path": file_path, "ttl_sec": ttl_sec}
+        if metadata is not None: p["metadata"] = metadata
+        return self._call("POST", "/v1/locks", p)["result"]
+
+    def unlock(self, file_path: str) -> dict:
+        return self._call("POST", "/v1/locks/release",
+            {"agent_id": self.agent_id, "file_path": file_path})["result"]
+
+    def complete_task(self, task_id: int) -> dict:
+        return self._call("POST", f"/v1/tasks/{int(task_id)}/complete", {})["result"]
+
+
 class FileRelayServer:
     def __init__(self, config: FileRelayConfig):
         self.config = config
@@ -1933,10 +2088,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
 </head>
 <body>
 <div id="header">
-  <h1>Megastructure Forge</h1>
+  <h1>Forge</h1>
   <span class="dot dot-green" id="status-dot"></span>
   <span id="status-text">Connecting...</span>
   <span id="channel-indicator" style="margin-left:.7rem;color:#94a3b8;font-size:.85rem;font-weight:400">#general</span>
+  <select id="thread-picker" style="margin-left:.7rem;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:.25rem;padding:.15rem .3rem;font-size:.78rem">
+    <option value="">(all channel messages)</option>
+  </select>
   <div id="agents-bar"></div>
 </div>
 <div id="shutdown-bar" style="display:none;padding:.4rem 1rem;background:#7f1d1d;
@@ -1944,6 +2102,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
   <span id="shutdown-msg"></span>
 </div>
 <div id="feed"><div class="empty">Loading messages...</div></div>
+<details id="inbox-panel" style="background:#0f1729;border-top:1px solid #334155;padding:.3rem .8rem;font-size:.82rem">
+  <summary style="cursor:pointer;color:#94a3b8">Operator inbox (<span id="inbox-count">0</span>)</summary>
+  <div id="inbox-feed" style="max-height:10rem;overflow-y:auto;margin-top:.3rem"></div>
+</details>
 <div id="input-bar">
   <input id="msg-input" type="text" placeholder="Send a message to agents..." autocomplete="off">
   <button id="send-btn">Send</button>
@@ -1954,7 +2116,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
 </div>
 <script>
 const NICK_COLORS=['#38bdf8','#34d399','#fbbf24','#f87171','#c084fc','#fb923c','#2dd4bf','#e879f9'];
-let lastId=0,seeded=false,currentChannel='general';
+let lastId=0,seeded=false,currentChannel='general',currentThread=null,inboxLastId=0;
 
 function $(id){return document.getElementById(id)}
 function esc(s){if(s==null)return'';const d=document.createElement('div');d.textContent=String(s);return d.innerHTML}
@@ -2002,12 +2164,17 @@ function renderAgents(agents){
   ).join('');
 }
 
+function pollUrl(){
+  // Thread takes precedence over channel when set — single source of truth.
+  const base=currentThread
+    ?'/v1/messages?thread_id='+encodeURIComponent(currentThread)
+    :'/v1/messages?channel='+encodeURIComponent(currentChannel);
+  return seeded ? base+'&since_id='+lastId : base+'&limit=50';
+}
+
 async function pollMessages(){
   try{
-    const url=seeded
-      ?'/v1/messages?channel='+currentChannel+'&since_id='+lastId
-      :'/v1/messages?channel='+currentChannel+'&limit=50';
-    const r=await fetch(url);
+    const r=await fetch(pollUrl());
     const j=await r.json();
     if(j.ok){
       if(j.result.length)appendMessages(j.result);
@@ -2169,13 +2336,60 @@ async function sendMessage(){
 $('msg-input').addEventListener('keydown',e=>{if(e.key==='Enter')sendMessage()});
 $('send-btn').addEventListener('click',sendMessage);
 
+async function loadThreads(){
+  try{
+    const r=await fetch('/v1/threads');
+    const j=await r.json();
+    if(!j.ok)return;
+    const sel=$('thread-picker');
+    const keep=currentThread||'';
+    sel.innerHTML='<option value="">(all channel messages)</option>'
+      +j.result.map(t=>'<option value="'+esc(t.thread_id)+'">'+esc(t.thread_id)+' ('+t.message_count+')</option>').join('');
+    sel.value=keep;
+  }catch(e){}
+}
+$('thread-picker').addEventListener('change',e=>{
+  currentThread=e.target.value||null;
+  lastId=0;seeded=false;
+  $('feed').innerHTML='<div class="empty">Loading messages...</div>';
+  $('channel-indicator').textContent=currentThread?('thread '+currentThread):'#'+currentChannel;
+  pollMessages();
+});
+
+function renderInbox(msgs){
+  const box=$('inbox-feed');
+  if(box.querySelector('.empty'))box.innerHTML='';
+  for(const m of msgs){
+    const div=document.createElement('div');
+    div.className='msg msg-operator';
+    const color=nickColor(m.from_agent);
+    div.innerHTML='<span class="msg-time">'+timeFmt(m.ts)+'</span>'
+      +'<span class="msg-from" style="color:'+color+'">'+esc(m.from_agent)+' &rarr; you</span>'
+      +esc(m.body);
+    box.appendChild(div);
+    if(m.id>inboxLastId)inboxLastId=m.id;
+  }
+  $('inbox-count').textContent=String(box.children.length);
+}
+async function pollInbox(){
+  try{
+    const r=await fetch('/v1/inbox/operator?since_id='+inboxLastId);
+    const j=await r.json();
+    if(j.ok&&j.result.length)renderInbox(j.result);
+  }catch(e){}
+}
+
 pollMessages();
 pollAgents();
 loadHubInfo();
+loadThreads();
+pollInbox();
 pollShutdownStatus();
 setInterval(pollMessages,3000);
 setInterval(pollAgents,5000);
 setInterval(pollShutdownStatus,5000);
+setInterval(loadThreads,10000);
+setInterval(pollInbox,3000);
 </script>
 </body>
 </html>"""
@@ -2230,6 +2444,29 @@ def main():
     smoke.add_argument("--timeout-sec", type=float, default=120.0)
     smoke.add_argument("--poll-interval-sec", type=float, default=1.0)
 
+    # ── Agent/human convenience CLI built on ForgeClient ────────────
+    ps = sub.add_parser("post", help="Post a message (or DM with --to)")
+    ps.add_argument("--agent", required=True, help="Your agent_id (registers with replace=True)")
+    ps.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    ps.add_argument("--channel", default="general")
+    ps.add_argument("--to", default=None, help="If set, sends as direct message to this agent")
+    ps.add_argument("--kind", default="chat", choices=sorted(MSG_KINDS))
+    ps.add_argument("--thread-id", default=None)
+    ps.add_argument("body")
+
+    pl = sub.add_parser("poll", help="Long-poll /v1/events as an agent (exclude_self by default)")
+    pl.add_argument("--agent", required=True)
+    pl.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    pl.add_argument("--channel", default=None)
+    pl.add_argument("--thread-id", default=None)
+    pl.add_argument("--timeout", type=float, default=30.0)
+    pl.add_argument("--since-id", type=int, default=0)
+    pl.add_argument("--include-self", action="store_true", help="Do not set exclude_self (default excludes own posts)")
+
+    wm = sub.add_parser("whoami", help="Print GET /v1/bootstrap for this agent")
+    wm.add_argument("--agent", required=True)
+    wm.add_argument("--base-url", default=DEFAULT_BASE_URL)
+
     a = ap.parse_args()
     if a.command == "ensure":
         r = ensure_hub(host=a.host, port=a.port, storage=a.storage, timeout=a.timeout, spool_dir=a.spool_dir,
@@ -2273,6 +2510,27 @@ def main():
         except SmokeError as exc:
             print(f"Smoke test failed: {exc}")
             raise SystemExit(1)
+    if a.command in ("post", "poll", "whoami"):
+        try:
+            client = ForgeClient(a.agent, base_url=a.base_url)
+            client.register(replace=True)
+            if a.command == "post":
+                if a.to:
+                    r = client.dm(a.to, a.body, kind=a.kind, thread_id=a.thread_id)
+                else:
+                    r = client.post(a.channel, a.body, kind=a.kind, thread_id=a.thread_id)
+                print(json.dumps(r, indent=2))
+            elif a.command == "poll":
+                client._since_id = a.since_id
+                msgs = client.poll(exclude_self=not a.include_self, timeout=a.timeout,
+                                   channel=a.channel, thread_id=a.thread_id)
+                for m in msgs: print(json.dumps(m))
+            else:  # whoami
+                print(json.dumps(client.bootstrap(), indent=2))
+        except ForgeError as exc:
+            print(f"forge error: {exc.error}")
+            raise SystemExit(1)
+        return
 
     cfg = HubConfig(
         listen_host=a.host,

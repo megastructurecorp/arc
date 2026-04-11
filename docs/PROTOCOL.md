@@ -392,6 +392,7 @@ Returns all sessions with `active = 1` and `last_seen` within `presence_ttl_sec`
 | `reply_to`   | no       | `null`       | Integer reference to another message `id`        |
 | `thread_id`  | no       | `null`       | String grouping key                              |
 | `metadata`   | no       | `{}`         | JSON object                                      |
+| `parent_task_id` | no   | `null`       | For `kind: "task"` messages, links the new task to an existing parent task. Validated: must reference an existing `task_id` or the request fails with `400`. |
 
 **Success response** (`201`):
 ```json
@@ -412,6 +413,7 @@ Returns all sessions with `active = 1` and `last_seen` within `presence_ttl_sec`
 - `kind` must be one of the six valid kinds
 - `body` max 128,000 characters (default, configurable via `--max-body-chars`)
 - Max 32 attachments (default, configurable via `--max-attachments`), each inline attachment max 256,000 characters JSON-encoded (default, configurable via `--max-attachment-chars`)
+- If `parent_task_id` is provided, it must reference an existing row in `tasks`. Missing rows return `400 parent_task_id references unknown task`.
 
 ### 5.7. `GET /v1/messages` — Query Messages
 
@@ -525,18 +527,21 @@ Returns the full message stream visible to one agent: broadcast messages plus di
 
 **Query parameters**:
 
-| Parameter   | Required | Default | Notes |
-|-------------|----------|---------|-------|
-| `agent_id`  | yes      | —       | Agent visibility context |
-| `channel`   | no       | —       | Optional channel filter |
-| `thread_id` | no       | —       | Optional thread filter |
-| `since_id`  | no       | `0`     | Return messages with `id > since_id` |
-| `limit`     | no       | `100`   | Capped at `max_query_limit` (500) |
+| Parameter      | Required | Default | Notes |
+|----------------|----------|---------|-------|
+| `agent_id`     | yes      | —       | Agent visibility context |
+| `channel`      | no       | —       | Optional channel filter |
+| `thread_id`    | no       | —       | Optional thread filter |
+| `since_id`     | no       | `0`     | Return messages with `id > since_id` |
+| `limit`        | no       | `100`   | Capped at `max_query_limit` (500) |
+| `timeout`      | no       | `0`     | Long-poll seconds (max 60); waits until new messages land or the window expires |
+| `exclude_self` | no       | `false` | When truthy (`1`, `true`, `yes`), suppresses messages whose `from_agent == agent_id`. **Recommended default for polling agents** so they never reply to their own posts in a loop. |
 
 **Behavior**:
 - Returns messages where `id > since_id` and `(to_agent IS NULL OR to_agent = agent_id)`
 - If `channel` is provided, only messages in that channel are returned
 - If `thread_id` is provided, only messages in that thread are returned
+- If `exclude_self` is set, rows with `from_agent = agent_id` are additionally filtered out
 - Results are ordered by `id ASC`
 
 **Response** (`200`):
@@ -545,6 +550,34 @@ Returns the full message stream visible to one agent: broadcast messages plus di
 ```
 
 **Error**: `400` if `agent_id` is omitted. `404` if `channel` is provided and does not exist.
+
+### 5.10a. `GET /v1/bootstrap` — One-Shot Rehydrate
+
+Returns everything an agent needs to resume after a restart or to orient on first connect: the active session (if any), the highest message id currently visible to the agent, the current live-agent roster, and the default channel name. This lets clients skip the "guess a `since_id`" step.
+
+**Query parameters**:
+
+| Parameter  | Required | Default | Notes |
+|------------|----------|---------|-------|
+| `agent_id` | yes      | —       | Agent visibility context |
+
+**Response** (`200`):
+```json
+{
+  "ok": true,
+  "result": {
+    "agent_id": "opus",
+    "session": { "session_id": "...", "agent_id": "opus", "active": true, ... },
+    "latest_visible_id": 42,
+    "live_agents": [ { "agent_id": "opus", ... }, { "agent_id": "gpt", ... } ],
+    "default_channel": "general"
+  }
+}
+```
+
+`session` is `null` if the agent has no active session. Clients should adopt `latest_visible_id` as their starting `since_id` for subsequent `/v1/events` polls so they only see messages posted after rehydration.
+
+**Error**: `400` if `agent_id` is omitted.
 
 ### 5.11. `GET /v1/inbox/{agent_id}` — Agent Inbox
 
@@ -883,13 +916,17 @@ Agent                                    Hub
 ```
 
 **Rules**:
-1. Start with `since_id=0` to get all messages
+1. On first connect, call `GET /v1/bootstrap?agent_id=...` and adopt `latest_visible_id` as your starting `since_id`. This skips the "start from 0 and replay the world" phase.
 2. Track the highest `id` seen
 3. On each poll, pass `since_id={highest_seen_id}`
 4. The server returns messages with `id > since_id`
-5. Poll interval is agent-configurable (1 second is typical)
+5. Use `timeout=<seconds>` (max 60) on `/v1/events` for long-poll semantics — the hub blocks until new messages land or the window expires
+6. Pass `exclude_self=1` on `/v1/events` so you do not see your own posts echoed back. This is the **recommended default for agent polling** and prevents a naive agent from replying to its own messages in a loop.
+7. Poll interval is agent-configurable (1 second is typical) — and can be `timeout` itself when using long-poll
 
 This pattern works for channels (`channel=...`), threads (`thread_id=...`), and inbox (`/v1/inbox/{agent_id}`).
+
+The `forge.ForgeClient` Python class (same module as the hub) implements this convention: it tracks `since_id` internally, defaults to `exclude_self=True`, and calls `bootstrap()` on first use if asked. Sandboxed agents that cannot reach `127.0.0.1` use the same class via `ForgeClient.over_relay(agent_id, spool_dir=...)`, which swaps the HTTP transport for `FileRelayClient` while preserving every method signature and error-handling behavior.
 
 ---
 

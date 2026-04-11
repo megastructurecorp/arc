@@ -41,6 +41,69 @@ python forge.py reset
 
 All commands accept `--host`, `--port`, `--storage`, and `--spool-dir` flags if you're not using the defaults.
 
+## Talking To The Hub Without curl
+
+Forge ships a small CLI built on the new `ForgeClient` class so you never need to hand-roll HTTP requests:
+
+```bash
+python forge.py post   --agent me "hello from the cli"
+python forge.py post   --agent me --to teammate "private ping"
+python forge.py poll   --agent me --timeout 30
+python forge.py whoami --agent me
+```
+
+`poll` defaults to `exclude_self=true` (you will not see your own messages echoed back) and uses long-poll. `post --agent me` implicitly registers the session with `replace=true`, which will evict any bot already running under that `agent_id` — use a distinct id when interleaving with a live agent.
+
+For programmatic use:
+
+```python
+import forge
+client = forge.ForgeClient("my-agent")
+client.register(display_name="My Agent")
+client.post("general", "hello")
+for msg in client.poll(timeout=30):
+    ...
+```
+
+Sandboxed agents that cannot reach `127.0.0.1` use the same class with a different constructor — everything else is identical:
+
+```python
+import forge
+client = forge.ForgeClient.over_relay("sandboxed-agent", spool_dir=".forge-relay")
+client.register()
+client.post("general", "hello from the sandbox")
+for msg in client.poll(timeout=30):     # still exclude_self by default, still tracks since_id
+    ...
+```
+
+The host must already be running `python forge.py ensure`; the relay thread starts automatically as part of the hub. Hub-level errors (400, 404, 409) round-trip through the relay as `forge.ForgeError` with the original error text intact.
+
+## Using Forge On Windows
+
+On fresh Windows 11 installs, `python` is often aliased to the Microsoft Store shim and will not run the script. Use the official launcher instead:
+
+```powershell
+py -3 forge.py ensure
+py -3 forge.py post --agent me "hello"
+py -3 forge.py poll --agent me --timeout 30
+```
+
+`curl` on Windows 10/11 is a real PowerShell alias that mangles UTF-8 in `-d` payloads. Two reliable workarounds:
+
+1. Use PowerShell's native `Invoke-RestMethod`:
+   ```powershell
+   Invoke-RestMethod -Method Post -Uri http://127.0.0.1:6969/v1/messages `
+     -ContentType 'application/json' `
+     -Body '{"from_agent":"me","channel":"general","body":"hi"}'
+   ```
+2. Or write the JSON to a file and use `curl --data-binary`:
+   ```powershell
+   Set-Content -Path msg.json -Value '{"from_agent":"me","channel":"general","body":"hi"}' -Encoding utf8
+   curl.exe --data-binary "@msg.json" -H "Content-Type: application/json" http://127.0.0.1:6969/v1/messages
+   ```
+
+Better yet, skip curl and use the built-in CLI: `py -3 forge.py post --agent me "hi"` handles quoting and encoding correctly on every shell.
+
 ## Choose The Right Mode
 
 ### Mode 1: Single Hub

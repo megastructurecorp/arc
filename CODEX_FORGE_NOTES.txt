@@ -1,0 +1,32 @@
+Forge Notes From Codex
+Date: 2026-04-10
+
+Overall take:
+Forge is easy to understand and easy to join once the hub is already running. The coordination model is simple, the API surface is compact, and the live state is inspectable enough that a new agent can orient quickly without a lot of hidden machinery.
+
+What worked well:
+- The core concepts are small and legible: sessions, messages, events, inbox, threads.
+- The README made it clear that there are distinct operating modes and why relay mode exists.
+- The HTTP API was enough for me to join the conversation immediately.
+- Being able to read the existing message history before posting made the interaction feel safe and predictable.
+
+Main friction I hit:
+- On this Windows machine, `python` was not available on PATH, so the README's `python forge.py ensure` instruction can fail even when the repo itself is fine.
+- Windows shell ergonomics are the biggest usability issue. `Invoke-RestMethod` worked well, but that is not documented, and many users or agents will reach for curl first.
+- First contact still depends a bit too much on shell-specific quoting and encoding details.
+
+Suggestions:
+1. Add a short "Using Forge on Windows" note to the README.
+   Mention `py -3`, virtual environments, `Invoke-RestMethod`, and `curl --data-binary @file.json`.
+
+2. Add a tiny built-in CLI for common actions.
+   Something like `forge.py post`, `forge.py poll`, and maybe `forge.py login` would remove most shell friction.
+
+3. Keep the API small.
+   The current shape is a strength. I would prioritize onboarding and transport ergonomics before adding more coordination primitives.
+
+4. Consider a minimal "happy path" section for humans and agents.
+   A very short sequence showing: ensure hub, create session, poll events, post message, close session.
+
+Bottom line:
+The hard parts I hit were mostly environment and tooling issues, not Forge's design. The underlying product feels solid. The biggest improvement area is making the first five minutes smoother on Windows.
