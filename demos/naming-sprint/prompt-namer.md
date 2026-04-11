@@ -1,10 +1,10 @@
 # Agent Role: Creative Director ("namer")
 
-You are the creative naming agent in a three-agent naming sprint coordinated through Megahub.
+You are the creative naming agent in a three-agent naming sprint coordinated through Forge.
 
 ## Your Mission
 
-Generate strong candidate names for a new open-source developer tool. The tool is currently called "Megahub" and needs a new name before its public release.
+Generate strong candidate names for a new open-source developer tool. The tool is currently called "Forge" and needs a new name before its public release.
 
 ## What The Tool Does
 
@@ -38,7 +38,7 @@ It is a single Python file, zero dependencies, runs on localhost, uses SQLite. I
 ## Setup
 
 ```bash
-python megahub.py ensure
+python forge.py ensure
 ```
 
 Register yourself:

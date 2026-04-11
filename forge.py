@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Megahub — single-file local-first agent coordination hub.
+"""Forge — single-file local-first agent coordination hub.
 
-    python megahub.py [--port 6969] [--storage megahub.sqlite3]
+    python forge.py [--port 6969] [--storage forge.sqlite3]
 
 Zero dependencies beyond Python 3.10+. HTTP + SQLite coordination for
 multi-agent systems. All responses are JSON: {"ok": true, "result": ...}
@@ -63,7 +63,7 @@ Quick-start curl examples:
   curl 'localhost:6969/v1/messages?channel=general&since_id=0'
   curl 'localhost:6969/v1/events?agent_id=my-agent&since_id=0&timeout=5'
 
-Python API (import megahub):
+Python API (import forge):
   ensure_hub(host, port, storage, timeout) -> dict   # start if needed
   create_server(config) -> _Srv                      # create server obj
   run_server(config)                                 # blocking serve
@@ -103,14 +103,14 @@ import urllib.parse
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
-# ── Megahub Architecture ──────────────────────────────────────────────
+# ── Forge Architecture ──────────────────────────────────────────────
 # HubConfig -> HubStore (SQLite) -> _H (HTTP handler) -> _Srv (server)
 # Public API: create_server / run_server / ensure_hub / stop_hub / reset_hub
 # Route table: see _P dict (~line 655)  |  Full spec: docs/PROTOCOL.md
 
 __version__ = "0.1.0"
 LOCAL_BIND_HOSTS = {"127.0.0.1", "localhost", "::1"}
-DEFAULT_SPOOL_DIR = ".megahub-relay"
+DEFAULT_SPOOL_DIR = ".forge-relay"
 DEFAULT_BASE_URL = "http://127.0.0.1:6969"
 DEFAULT_CHANNEL = "smoke-room"
 DEFAULT_THREAD_ID = "smoke-relay-001"
@@ -133,7 +133,7 @@ def to_iso(dt):
 def from_iso(value):
     return _from_iso(value)
 
-PIDFILE_NAME = ".megahub.pid"
+PIDFILE_NAME = ".forge.pid"
 def _storage_dir(storage_path):
     p = Path(storage_path)
     if not p.is_absolute(): p = Path.cwd() / p
@@ -176,7 +176,7 @@ _candidate_pidfiles = _pidfile_candidates
 @dataclass(slots=True)
 class HubConfig:
     listen_host: str = "127.0.0.1"; port: int = 6969; allow_remote: bool = False
-    storage_path: str = "megahub.sqlite3"; log_events: bool = True
+    storage_path: str = "forge.sqlite3"; log_events: bool = True
     presence_ttl_sec: int = 120; max_body_chars: int = 128_000
     max_attachment_chars: int = 256_000; max_attachments: int = 32; max_query_limit: int = 500
     def validate(self):
@@ -199,7 +199,7 @@ class HubConfig:
             if storage_path.exists():
                 with storage_path.open("ab"): pass
             else:
-                with tempfile.NamedTemporaryFile(dir=storage_path.parent, prefix=".megahub-write-check-", delete=True): pass
+                with tempfile.NamedTemporaryFile(dir=storage_path.parent, prefix=".forge-write-check-", delete=True): pass
         except OSError as e:
             raise ValueError(f"storage_path is not writable: {storage_path}") from e
 
@@ -791,7 +791,7 @@ class _H(BaseHTTPRequestHandler):
     def _ok(self, d, s=200):
         b = json.dumps(d).encode()
         self.send_response(s); self.send_header("Content-Type","application/json")
-        self.send_header("X-Megahub-Instance", self.server.instance_id)
+        self.send_header("X-Forge-Instance", self.server.instance_id)
         self.send_header("Connection","close")
         self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
         self.close_connection = True
@@ -802,7 +802,7 @@ class _H(BaseHTTPRequestHandler):
     def _html(self, html):
         b = html.encode("utf-8")
         self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8")
-        self.send_header("X-Megahub-Instance", self.server.instance_id)
+        self.send_header("X-Forge-Instance", self.server.instance_id)
         self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
 
     def do_GET(self):
@@ -1070,7 +1070,7 @@ class _Srv(ThreadingMixIn, HTTPServer):
         if not self.cfg.log_events:
             return
         stamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        print(f"[megahub {stamp}] {message}")
+        print(f"[forge {stamp}] {message}")
 
     def _write_pidfile(self):
         payload = {"pid": os.getpid(), "port": self.bound_port, "url": _pidfile_url(self.cfg.listen_host, self.bound_port)}
@@ -1126,7 +1126,7 @@ class _Srv(ThreadingMixIn, HTTPServer):
         )
         ensure_spool_dirs(self._spool_dir)
         self._relay = FileRelayServer(relay_cfg)
-        self._relay_thread = threading.Thread(target=self._relay.run, name="megahub-relay", daemon=True)
+        self._relay_thread = threading.Thread(target=self._relay.run, name="forge-relay", daemon=True)
         self._relay_thread.start()
         self.log(f"relay started (spool={self._spool_dir})")
 
@@ -1306,7 +1306,7 @@ def run_server(config=None, *, spool_dir=DEFAULT_SPOOL_DIR):
     cfg.validate()
     if cfg.allow_remote:
         print(
-            "[megahub] Warning: allow_remote=true exposes this daemon to non-local clients. "
+            "[forge] Warning: allow_remote=true exposes this daemon to non-local clients. "
             "There is no built-in auth in v1."
         )
     srv = create_server(cfg, spool_dir=spool_dir)
@@ -1323,7 +1323,7 @@ def _probe_hub(url):
     except (urllib.error.URLError, OSError, TimeoutError): return False
 
 
-def _find_running_hub(storage="megahub.sqlite3", host="127.0.0.1", port=6969):
+def _find_running_hub(storage="forge.sqlite3", host="127.0.0.1", port=6969):
     """Return (url, pid_info) for a running hub, or (None, None)."""
     pid_info = _discover_pidfile(storage)
     if pid_info and _probe_hub(pid_info["url"]):
@@ -1334,7 +1334,7 @@ def _find_running_hub(storage="megahub.sqlite3", host="127.0.0.1", port=6969):
     return None, pid_info
 
 
-def stop_hub(storage="megahub.sqlite3", host="127.0.0.1", port=6969):
+def stop_hub(storage="forge.sqlite3", host="127.0.0.1", port=6969):
     """Stop a running hub. Returns dict with stopped (bool) and details."""
     import signal
     url, pid_info = _find_running_hub(storage, host, port)
@@ -1356,7 +1356,7 @@ def stop_hub(storage="megahub.sqlite3", host="127.0.0.1", port=6969):
     return {"stopped": False, "error": "hub is responding but no pidfile found to identify process"}
 
 
-def reset_hub(storage="megahub.sqlite3", host="127.0.0.1", port=6969):
+def reset_hub(storage="forge.sqlite3", host="127.0.0.1", port=6969):
     """Stop the hub if running, then delete the SQLite database. Returns dict."""
     url, _ = _find_running_hub(storage, host, port)
     if url is not None:
@@ -1379,7 +1379,7 @@ def reset_hub(storage="megahub.sqlite3", host="127.0.0.1", port=6969):
     return {"reset": True, "removed": removed}
 
 
-def ensure_hub(host="127.0.0.1", port=6969, storage="megahub.sqlite3", timeout=5.0, spool_dir=DEFAULT_SPOOL_DIR,
+def ensure_hub(host="127.0.0.1", port=6969, storage="forge.sqlite3", timeout=5.0, spool_dir=DEFAULT_SPOOL_DIR,
                max_body_chars=128_000, max_attachment_chars=256_000, max_attachments=32):
     """Check if a hub is running; if not, start one in the background.
     Returns dict with: running (bool), started (bool), url (str).
@@ -1888,7 +1888,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Megahub</title>
+<title>Forge</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
@@ -1933,7 +1933,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
 </head>
 <body>
 <div id="header">
-  <h1>Megahub</h1>
+  <h1>Megastructure Forge</h1>
   <span class="dot dot-green" id="status-dot"></span>
   <span id="status-text">Connecting...</span>
   <span id="channel-indicator" style="margin-left:.7rem;color:#94a3b8;font-size:.85rem;font-weight:400">#general</span>
@@ -2181,11 +2181,11 @@ setInterval(pollShutdownStatus,5000);
 </html>"""
 
 def main():
-    ap = argparse.ArgumentParser(description="Megahub - single-file agent coordination hub")
+    ap = argparse.ArgumentParser(description="Forge - single-file agent coordination hub")
     sub = ap.add_subparsers(dest="command")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=6969)
-    ap.add_argument("--storage", default="megahub.sqlite3")
+    ap.add_argument("--storage", default="forge.sqlite3")
     ap.add_argument("--allow-remote", action="store_true")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--spool-dir", default=DEFAULT_SPOOL_DIR)
@@ -2196,7 +2196,7 @@ def main():
     ens = sub.add_parser("ensure", help="Start hub if not already running, then exit")
     ens.add_argument("--host", default="127.0.0.1")
     ens.add_argument("--port", type=int, default=6969)
-    ens.add_argument("--storage", default="megahub.sqlite3")
+    ens.add_argument("--storage", default="forge.sqlite3")
     ens.add_argument("--spool-dir", default=DEFAULT_SPOOL_DIR)
     ens.add_argument("--timeout", type=float, default=5.0)
     ens.add_argument("--max-body-chars", type=int, default=128_000, help="Maximum characters in a message body")
@@ -2206,12 +2206,12 @@ def main():
     stp = sub.add_parser("stop", help="Stop a running hub")
     stp.add_argument("--host", default="127.0.0.1")
     stp.add_argument("--port", type=int, default=6969)
-    stp.add_argument("--storage", default="megahub.sqlite3")
+    stp.add_argument("--storage", default="forge.sqlite3")
 
     rst = sub.add_parser("reset", help="Stop the hub and delete the database")
     rst.add_argument("--host", default="127.0.0.1")
     rst.add_argument("--port", type=int, default=6969)
-    rst.add_argument("--storage", default="megahub.sqlite3")
+    rst.add_argument("--storage", default="forge.sqlite3")
 
     relay = sub.add_parser("relay", help="Forward file-spooled relay requests to the local hub")
     relay.add_argument("--base-url", default=DEFAULT_BASE_URL)

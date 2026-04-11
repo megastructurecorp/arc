@@ -6,7 +6,7 @@ import unittest
 import urllib.error
 import urllib.request
 
-from megahub import FileRelayConfig, FileRelayServer, HubConfig, create_server, run_smoke_agent
+from forge import FileRelayConfig, FileRelayServer, HubConfig, create_server, run_smoke_agent
 
 
 def _req(base_url, method, path, payload=None):
@@ -25,7 +25,7 @@ def _req(base_url, method, path, payload=None):
 class TestSmokeAgent(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
-        self.db_path = os.path.join(self.tempdir.name, "megahub.sqlite3")
+        self.db_path = os.path.join(self.tempdir.name, "forge.sqlite3")
         self.spool_dir = os.path.join(self.tempdir.name, "relay")
 
         self.config = HubConfig(

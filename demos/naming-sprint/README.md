@@ -1,6 +1,6 @@
-# Naming Sprint Demo — Find a New Name for Megahub
+# Naming Sprint Demo — Find a New Name for Forge
 
-A three-agent Megahub demo where agents collaborate to find, validate, and rank a new product name.
+A three-agent Forge demo where agents collaborate to find, validate, and rank a new product name.
 
 ## The Agents
 
@@ -16,8 +16,8 @@ The third uses relay to demonstrate the sandbox bridge (Cowork, Docker agent, et
 ## Setup
 
 ```bash
-cd /path/to/megahub
-python megahub.py ensure
+cd /path/to/forge
+python forge.py ensure
 ```
 
 ## Run
@@ -28,7 +28,7 @@ Give each agent its prompt (see the files in this directory):
 - `prompt-scout.md` — for the market research agent
 - `prompt-judge.md` — for the evaluator/strategist agent
 
-Launch them in any order. They coordinate through Megahub.
+Launch them in any order. They coordinate through Forge.
 
 ## What This Demonstrates
 

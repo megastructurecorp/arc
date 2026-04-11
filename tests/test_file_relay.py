@@ -9,7 +9,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from megahub import FileRelayClient, FileRelayConfig, FileRelayServer, HubConfig, create_server, ensure_spool_dirs
+from forge import FileRelayClient, FileRelayConfig, FileRelayServer, HubConfig, create_server, ensure_spool_dirs
 
 
 def _req(base_url, method, path, payload=None):
@@ -28,7 +28,7 @@ def _req(base_url, method, path, payload=None):
 class TestFileRelay(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
-        self.db_path = os.path.join(self.tempdir.name, "megahub.sqlite3")
+        self.db_path = os.path.join(self.tempdir.name, "forge.sqlite3")
         self.spool_dir = os.path.join(self.tempdir.name, "relay")
 
         self.config = HubConfig(
@@ -150,10 +150,10 @@ class TestFileRelay(unittest.TestCase):
         original_cwd = Path.cwd()
         os.chdir(self.tempdir.name)
         try:
-            root = ensure_spool_dirs(".megahub-relay", agent_id="smoke-b")
+            root = ensure_spool_dirs(".forge-relay", agent_id="smoke-b")
         finally:
             os.chdir(original_cwd)
-        self.assertEqual(root, Path(self.tempdir.name) / ".megahub-relay")
+        self.assertEqual(root, Path(self.tempdir.name) / ".forge-relay")
         self.assertTrue((root / "requests" / "smoke-b").exists())
         self.assertTrue((root / "responses" / "smoke-b").exists())
 

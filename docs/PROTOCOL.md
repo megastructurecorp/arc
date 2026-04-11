@@ -1,11 +1,11 @@
-# Megahub Protocol Specification v1
+# Forge Protocol Specification v1
 
 **Status**: Stable draft — all endpoints implemented and tested  
 **Transport**: HTTP/1.1 JSON  
 **Storage**: SQLite 3 (WAL mode)  
 **Dependencies**: Python 3.10+ standard library (reference implementation)
 
-This document is the complete specification for the Megahub agent coordination protocol. Any implementation that conforms to the endpoint contracts, JSON shapes, and state machines described here is a compatible Megahub hub. An agent can build one from this spec alone.
+This document is the complete specification for the Forge agent coordination protocol. Any implementation that conforms to the endpoint contracts, JSON shapes, and state machines described here is a compatible Forge hub. An agent can build one from this spec alone.
 
 ---
 
@@ -35,7 +35,7 @@ This document is the complete specification for the Megahub agent coordination p
 
 ## 1. Overview
 
-Megahub is a local-first HTTP + SQLite coordination service for multi-agent systems. It provides:
+Forge is a local-first HTTP + SQLite coordination service for multi-agent systems. It provides:
 
 - **Sessions**: Agent presence tracking with TTL-based expiry
 - **Channels**: Named message streams (broadcast)
@@ -44,12 +44,12 @@ Megahub is a local-first HTTP + SQLite coordination service for multi-agent syst
 - **Claims**: Atomic task ownership with TTL, refresh, and release
 - **File Locks**: Per-file advisory locks to prevent edit conflicts
 - **Structured Subtasks**: Parent-child task trees with completion rollup
-- **PID File Discovery**: Automatic hub discovery via `.megahub.pid`
+- **PID File Discovery**: Automatic hub discovery via `.forge.pid`
 - **Live Dashboard**: Auto-refreshing HTML dashboard at `GET /`
 
 Agents interact exclusively via HTTP JSON requests. There is no WebSocket, no long-polling, and no push — agents poll with `since_id` for new messages.
 
-The hub binds to `127.0.0.1:6969` by default. All data persists in a single SQLite file (`megahub.sqlite3`).
+The hub binds to `127.0.0.1:6969` by default. All data persists in a single SQLite file (`forge.sqlite3`).
 
 ---
 
@@ -236,7 +236,7 @@ Stale sessions are filtered by TTL and background pruning. A hub MUST NOT global
 
 All JSON endpoints accept and return `Content-Type: application/json`.
 
-Conforming hubs SHOULD include an `X-Megahub-Instance` response header on every response. The value is an opaque, stable identifier for the underlying hub database so clients can detect when they have silently started talking to a different Megahub instance.
+Conforming hubs SHOULD include an `X-Forge-Instance` response header on every response. The value is an opaque, stable identifier for the underlying hub database so clients can detect when they have silently started talking to a different Forge instance.
 
 ### Shared POST Parsing Rules
 
@@ -350,7 +350,7 @@ Returns all sessions with `active = 1` and `last_seen` within `presence_ttl_sec`
 {
   "ok": true,
   "result": {
-    "storage_path": "/abs/path/to/megahub.sqlite3",
+    "storage_path": "/abs/path/to/forge.sqlite3",
     "instance_id": "mh1-0123456789abcdef0123",
     "journal_mode": "wal",
     "wal_mode": true
@@ -360,7 +360,7 @@ Returns all sessions with `active = 1` and `last_seen` within `presence_ttl_sec`
 
 **Notes**:
 - `storage_path` is the resolved SQLite file path used by this hub process
-- `instance_id` is the same opaque identifier surfaced via `X-Megahub-Instance`
+- `instance_id` is the same opaque identifier surfaced via `X-Forge-Instance`
 - `journal_mode` reports SQLite's actual journal mode for this process
 - `wal_mode` is a convenience boolean equivalent to `journal_mode == "wal"`
 
@@ -1018,7 +1018,7 @@ POST /v1/tasks/3/complete  → done, parent_completed: true (task 1 auto-complet
 
 ### PID File
 
-When the hub starts, it writes a `.megahub.pid` file in the same directory as the SQLite database:
+When the hub starts, it writes a `.forge.pid` file in the same directory as the SQLite database:
 
 ```json
 { "pid": 12345, "port": 6969, "url": "http://127.0.0.1:6969" }
@@ -1031,7 +1031,7 @@ On clean shutdown, the PID file is removed (only if the PID and port match, to a
 `ensure_hub()` uses PID file discovery before falling back to direct probing:
 
 ```
-1. Search for .megahub.pid upward from CWD and the storage directory
+1. Search for .forge.pid upward from CWD and the storage directory
 2. If found, read the URL and probe it
 3. If the probe succeeds → hub is running at that URL
 4. Fall back to probing http://{host}:{port}/v1/channels
@@ -1044,7 +1044,7 @@ This allows agents in different working directories to find the same hub instanc
 ### Bootstrap Algorithm
 
 ```
-1. Discover:  Search for .megahub.pid, then probe http://{host}:{port}/v1/channels
+1. Discover:  Search for .forge.pid, then probe http://{host}:{port}/v1/channels
 2. If 200 OK → hub is running → proceed to register session
 3. If connection refused →
      a. Start the hub as a background process
@@ -1059,8 +1059,8 @@ This allows agents in different working directories to find the same hub instanc
 ### Reference: `ensure_hub()` API
 
 ```
-megahub ensure [--host HOST] [--port PORT] [--storage PATH] [--timeout SEC]
-python megahub_single.py ensure [--host HOST] [--port PORT] [--storage PATH] [--timeout SEC]
+forge ensure [--host HOST] [--port PORT] [--storage PATH] [--timeout SEC]
+python forge_single.py ensure [--host HOST] [--port PORT] [--storage PATH] [--timeout SEC]
 ```
 
 Returns JSON:
@@ -1085,10 +1085,10 @@ The page refreshes every 5 seconds. No JavaScript framework — just inline `fet
 
 ## 17. Orchestration CLI
 
-The `megahub orchestrate` command automates the common pattern of seeding a task and waiting for agents to complete:
+The `forge orchestrate` command automates the common pattern of seeding a task and waiting for agents to complete:
 
 ```bash
-megahub orchestrate --task "Build the parser" --agents "alpha,beta,gamma" \
+forge orchestrate --task "Build the parser" --agents "alpha,beta,gamma" \
     [--channel NAME] [--thread-id TID] [--timeout 300] [--poll-interval-sec 1]
 ```
 
@@ -1107,7 +1107,7 @@ megahub orchestrate --task "Build the parser" --agents "alpha,beta,gamma" \
 
 ## 18. Interop Contract
 
-If you implement these 23 endpoints with these exact JSON request/response shapes, any Megahub client will work with your server:
+If you implement these 23 endpoints with these exact JSON request/response shapes, any Forge client will work with your server:
 
 | # | Method | Path                         | Function              |
 |---|--------|------------------------------|-----------------------|
@@ -1145,7 +1145,7 @@ If you implement these 23 endpoints with these exact JSON request/response shape
 
 ## 19. Build Your Own
 
-Minimal checklist for building a compatible Megahub hub in any language:
+Minimal checklist for building a compatible Forge hub in any language:
 
 ### Storage
 - [ ] Create the six tables: `channels`, `messages`, `sessions`, `claims`, `locks`, `tasks`
@@ -1155,8 +1155,8 @@ Minimal checklist for building a compatible Megahub hub in any language:
 
 ### Bootstrapping
 - [ ] On startup: attempt WAL mode, ensure `general` and `direct` channels
-- [ ] Write `.megahub.pid` with `pid`, `port`, and `url`
-- [ ] On shutdown: remove `.megahub.pid` if it matches current process
+- [ ] Write `.forge.pid` with `pid`, `port`, and `url`
+- [ ] On shutdown: remove `.forge.pid` if it matches current process
 
 ### Sessions
 - [ ] `POST /v1/sessions`: Generate UUID, enforce one-active-per-agent, support `replace`
@@ -1198,7 +1198,7 @@ Minimal checklist for building a compatible Megahub hub in any language:
 
 ### Hub Introspection
 - [ ] `GET /v1/hub-info`: Return resolved storage path, instance id, and journal/WAL mode
-- [ ] Include `X-Megahub-Instance` on responses
+- [ ] Include `X-Forge-Instance` on responses
 
 ### Validation
 - [ ] `from_agent` is required and non-empty on messages
@@ -1216,7 +1216,7 @@ Run the reference test suite against your implementation. The reference test sui
 
 ## 20. Deployment Modes
 
-Megahub supports two first-class deployment modes.
+Forge supports two first-class deployment modes.
 
 ### Single-Hub Mode
 
@@ -1249,4 +1249,4 @@ In shared-filesystem mode, different hub processes may expose different local UR
 - **Process identity**: local URL, PID, pidfile
 - **Hub identity**: SQLite file plus the stable `instance_id`
 
-`X-Megahub-Instance` exists so agents can distinguish these cases cleanly.
+`X-Forge-Instance` exists so agents can distinguish these cases cleanly.
