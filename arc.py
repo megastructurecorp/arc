@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Forge — single-file local-first agent coordination hub.
+"""Arc — single-file local-first agent coordination hub.
 
-    python forge.py [--port 6969] [--storage forge.sqlite3]
+    python arc.py [--port 6969] [--storage arc.sqlite3]
 
 Zero dependencies beyond Python 3.10+. HTTP + SQLite coordination for
 multi-agent systems. All responses are JSON: {"ok": true, "result": ...}
@@ -63,7 +63,7 @@ Quick-start curl examples:
   curl 'localhost:6969/v1/messages?channel=general&since_id=0'
   curl 'localhost:6969/v1/events?agent_id=my-agent&since_id=0&timeout=5'
 
-Python API (import forge):
+Python API (import arc):
   ensure_hub(host, port, storage, timeout) -> dict   # start if needed
   create_server(config) -> _Srv                      # create server obj
   run_server(config)                                 # blocking serve
@@ -103,14 +103,14 @@ import urllib.parse
 import urllib.request
 from urllib.parse import parse_qs, urlparse
 
-# ── Forge Architecture ──────────────────────────────────────────────
+# ── Arc Architecture ────────────────────────────────────────────────
 # HubConfig -> HubStore (SQLite) -> _H (HTTP handler) -> _Srv (server)
 # Public API: create_server / run_server / ensure_hub / stop_hub / reset_hub
 # Route table: see _P dict (~line 655)  |  Full spec: docs/PROTOCOL.md
 
 __version__ = "0.1.0"
 LOCAL_BIND_HOSTS = {"127.0.0.1", "localhost", "::1"}
-DEFAULT_SPOOL_DIR = ".forge-relay"
+DEFAULT_SPOOL_DIR = ".arc-relay"
 DEFAULT_BASE_URL = "http://127.0.0.1:6969"
 DEFAULT_CHANNEL = "smoke-room"
 DEFAULT_THREAD_ID = "smoke-relay-001"
@@ -133,7 +133,7 @@ def to_iso(dt):
 def from_iso(value):
     return _from_iso(value)
 
-PIDFILE_NAME = ".forge.pid"
+PIDFILE_NAME = ".arc.pid"
 def _storage_dir(storage_path):
     p = Path(storage_path)
     if not p.is_absolute(): p = Path.cwd() / p
@@ -184,7 +184,7 @@ _ALREADY_SENT = object()  # sentinel returned by handlers that wrote their own r
 @dataclass(slots=True)
 class HubConfig:
     listen_host: str = "127.0.0.1"; port: int = 6969; allow_remote: bool = False
-    storage_path: str = "forge.sqlite3"; log_events: bool = True
+    storage_path: str = "arc.sqlite3"; log_events: bool = True
     presence_ttl_sec: int = 120; max_body_chars: int = 128_000
     max_attachment_chars: int = 256_000; max_attachments: int = 32; max_query_limit: int = 500
     def validate(self):
@@ -207,7 +207,7 @@ class HubConfig:
             if storage_path.exists():
                 with storage_path.open("ab"): pass
             else:
-                with tempfile.NamedTemporaryFile(dir=storage_path.parent, prefix=".forge-write-check-", delete=True): pass
+                with tempfile.NamedTemporaryFile(dir=storage_path.parent, prefix=".arc-write-check-", delete=True): pass
         except OSError as e:
             raise ValueError(f"storage_path is not writable: {storage_path}") from e
 
@@ -889,7 +889,7 @@ class _H(BaseHTTPRequestHandler):
     def _ok(self, d, s=200):
         b = json.dumps(d).encode()
         self.send_response(s); self.send_header("Content-Type","application/json")
-        self.send_header("X-Forge-Instance", self.server.instance_id)
+        self.send_header("X-Arc-Instance", self.server.instance_id)
         self.send_header("Connection","close")
         self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
         self.close_connection = True
@@ -900,7 +900,7 @@ class _H(BaseHTTPRequestHandler):
     def _html(self, html):
         b = html.encode("utf-8")
         self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8")
-        self.send_header("X-Forge-Instance", self.server.instance_id)
+        self.send_header("X-Arc-Instance", self.server.instance_id)
         self.send_header("Content-Length",str(len(b))); self.end_headers(); self.wfile.write(b)
 
     # ── Dispatch ──────────────────────────────────────────────────────
@@ -1089,7 +1089,7 @@ class _Srv(ThreadingMixIn, HTTPServer):
         if not self.cfg.log_events:
             return
         stamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        print(f"[forge {stamp}] {message}")
+        print(f"[arc {stamp}] {message}")
 
     def _write_pidfile(self):
         payload = {"pid": os.getpid(), "port": self.bound_port, "url": _pidfile_url(self.cfg.listen_host, self.bound_port)}
@@ -1145,7 +1145,7 @@ class _Srv(ThreadingMixIn, HTTPServer):
         )
         ensure_spool_dirs(self._spool_dir)
         self._relay = FileRelayServer(relay_cfg)
-        self._relay_thread = threading.Thread(target=self._relay.run, name="forge-relay", daemon=True)
+        self._relay_thread = threading.Thread(target=self._relay.run, name="arc-relay", daemon=True)
         self._relay_thread.start()
         self.log(f"relay started (spool={self._spool_dir})")
 
@@ -1325,7 +1325,7 @@ def run_server(config=None, *, spool_dir=DEFAULT_SPOOL_DIR):
     cfg.validate()
     if cfg.allow_remote:
         print(
-            "[forge] Warning: allow_remote=true exposes this daemon to non-local clients. "
+            "[arc] Warning: allow_remote=true exposes this daemon to non-local clients. "
             "There is no built-in auth in v1."
         )
     srv = create_server(cfg, spool_dir=spool_dir)
@@ -1342,7 +1342,7 @@ def _probe_hub(url):
     except (urllib.error.URLError, OSError, TimeoutError): return False
 
 
-def _find_running_hub(storage="forge.sqlite3", host="127.0.0.1", port=6969):
+def _find_running_hub(storage="arc.sqlite3", host="127.0.0.1", port=6969):
     """Return (url, pid_info) for a running hub, or (None, None)."""
     pid_info = _discover_pidfile(storage)
     if pid_info and _probe_hub(pid_info["url"]):
@@ -1353,7 +1353,7 @@ def _find_running_hub(storage="forge.sqlite3", host="127.0.0.1", port=6969):
     return None, pid_info
 
 
-def stop_hub(storage="forge.sqlite3", host="127.0.0.1", port=6969):
+def stop_hub(storage="arc.sqlite3", host="127.0.0.1", port=6969):
     """Stop a running hub. Returns dict with stopped (bool) and details."""
     import signal
     url, pid_info = _find_running_hub(storage, host, port)
@@ -1375,7 +1375,7 @@ def stop_hub(storage="forge.sqlite3", host="127.0.0.1", port=6969):
     return {"stopped": False, "error": "hub is responding but no pidfile found to identify process"}
 
 
-def reset_hub(storage="forge.sqlite3", host="127.0.0.1", port=6969):
+def reset_hub(storage="arc.sqlite3", host="127.0.0.1", port=6969):
     """Stop the hub if running, then delete the SQLite database. Returns dict."""
     url, _ = _find_running_hub(storage, host, port)
     if url is not None:
@@ -1398,7 +1398,7 @@ def reset_hub(storage="forge.sqlite3", host="127.0.0.1", port=6969):
     return {"reset": True, "removed": removed}
 
 
-def ensure_hub(host="127.0.0.1", port=6969, storage="forge.sqlite3", timeout=5.0, spool_dir=DEFAULT_SPOOL_DIR,
+def ensure_hub(host="127.0.0.1", port=6969, storage="arc.sqlite3", timeout=5.0, spool_dir=DEFAULT_SPOOL_DIR,
                max_body_chars=128_000, max_attachment_chars=256_000, max_attachments=32):
     """Check if a hub is running; if not, start one in the background.
     Returns dict with: running (bool), started (bool), url (str).
@@ -1591,15 +1591,15 @@ class FileRelayClient:
         return _error_response(request_id, 598, "relay timed out waiting for response")
 
 
-class ForgeError(Exception):
-    """Raised by ForgeClient when the hub returns an !ok envelope."""
+class ArcError(Exception):
+    """Raised by ArcClient when the hub returns an !ok envelope."""
     def __init__(self, error: str, status: int = 400):
         super().__init__(error)
         self.error = error
         self.status = status
 
 class _HTTPTransport:
-    """Direct HTTP transport for ForgeClient (urllib.request under the hood)."""
+    """Direct HTTP transport for ArcClient (urllib.request under the hood)."""
     def __init__(self, base_url: str, timeout: float):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -1611,8 +1611,8 @@ class _RelayTransport:
     Wraps FileRelayClient and unwraps its envelope so callers see the hub envelope directly.
 
     The relay envelope nests the hub's response under `body`. A hub 4xx is still a
-    successful transport — we return the hub envelope as-is and let ForgeClient._call
-    raise ForgeError on !ok. A transport-level failure (timeout, spool error, malformed
+    successful transport — we return the hub envelope as-is and let ArcClient._call
+    raise ArcError on !ok. A transport-level failure (timeout, spool error, malformed
     envelope) has no `body` — we synthesize an error envelope from the top-level fields.
     """
     def __init__(self, relay_client: "FileRelayClient"):
@@ -1623,12 +1623,12 @@ class _RelayTransport:
         if isinstance(body, dict): return body
         return {"ok": False, "error": r.get("error") or "relay transport error"}
 
-class ForgeClient:
-    """Client for the Forge hub. Tracks since_id internally so poll() is idempotent.
+class ArcClient:
+    """Client for the Arc hub. Tracks since_id internally so poll() is idempotent.
 
     Two ways to construct:
-      ForgeClient(agent_id, base_url=...)            # direct HTTP (default)
-      ForgeClient.over_relay(agent_id, spool_dir=...) # file-spooled relay (sandboxed)
+      ArcClient(agent_id, base_url=...)            # direct HTTP (default)
+      ArcClient.over_relay(agent_id, spool_dir=...) # file-spooled relay (sandboxed)
 
     Construct once per agent process. `exclude_self=True` is the default on poll() —
     callers that want their own posts echoed back must pass exclude_self=False.
@@ -1642,16 +1642,16 @@ class ForgeClient:
         self._since_id = 0
 
     @classmethod
-    def over_relay(cls, agent_id: str, spool_dir: str = DEFAULT_SPOOL_DIR, *, timeout: float = 30.0) -> "ForgeClient":
-        """Construct a ForgeClient that talks to the hub via the file-spool relay.
+    def over_relay(cls, agent_id: str, spool_dir: str = DEFAULT_SPOOL_DIR, *, timeout: float = 30.0) -> "ArcClient":
+        """Construct a ArcClient that talks to the hub via the file-spool relay.
         Use this in sandboxes that cannot reach 127.0.0.1 and cannot safely use SQLite
-        on the shared mount. The host must already be running `python forge.py ensure`."""
+        on the shared mount. The host must already be running `python arc.py ensure`."""
         rc = FileRelayClient(agent_id=agent_id, spool_dir=spool_dir, timeout=timeout)
         return cls(agent_id, timeout=timeout, transport=_RelayTransport(rc))
 
     def _call(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         resp = self._transport.call(method, path, payload)
-        if not resp.get("ok"): raise ForgeError(resp.get("error", "unknown error"))
+        if not resp.get("ok"): raise ArcError(resp.get("error", "unknown error"))
         return resp
 
     def register(self, *, display_name=None, replace=True, capabilities=None, metadata=None) -> dict:
@@ -2043,7 +2043,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Forge</title>
+<title>Arc</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
@@ -2088,7 +2088,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
 </head>
 <body>
 <div id="header">
-  <h1>Forge</h1>
+  <h1>Arc</h1>
   <span class="dot dot-green" id="status-dot"></span>
   <span id="status-text">Connecting...</span>
   <span id="channel-indicator" style="margin-left:.7rem;color:#94a3b8;font-size:.85rem;font-weight:400">#general</span>
@@ -2421,11 +2421,11 @@ setInterval(pollInbox,3000);
 </html>"""
 
 def main():
-    ap = argparse.ArgumentParser(description="Forge - single-file agent coordination hub")
+    ap = argparse.ArgumentParser(description="Arc - single-file agent coordination hub")
     sub = ap.add_subparsers(dest="command")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=6969)
-    ap.add_argument("--storage", default="forge.sqlite3")
+    ap.add_argument("--storage", default="arc.sqlite3")
     ap.add_argument("--allow-remote", action="store_true")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--spool-dir", default=DEFAULT_SPOOL_DIR)
@@ -2436,7 +2436,7 @@ def main():
     ens = sub.add_parser("ensure", help="Start hub if not already running, then exit")
     ens.add_argument("--host", default="127.0.0.1")
     ens.add_argument("--port", type=int, default=6969)
-    ens.add_argument("--storage", default="forge.sqlite3")
+    ens.add_argument("--storage", default="arc.sqlite3")
     ens.add_argument("--spool-dir", default=DEFAULT_SPOOL_DIR)
     ens.add_argument("--timeout", type=float, default=5.0)
     ens.add_argument("--max-body-chars", type=int, default=128_000, help="Maximum characters in a message body")
@@ -2446,12 +2446,12 @@ def main():
     stp = sub.add_parser("stop", help="Stop a running hub")
     stp.add_argument("--host", default="127.0.0.1")
     stp.add_argument("--port", type=int, default=6969)
-    stp.add_argument("--storage", default="forge.sqlite3")
+    stp.add_argument("--storage", default="arc.sqlite3")
 
     rst = sub.add_parser("reset", help="Stop the hub and delete the database")
     rst.add_argument("--host", default="127.0.0.1")
     rst.add_argument("--port", type=int, default=6969)
-    rst.add_argument("--storage", default="forge.sqlite3")
+    rst.add_argument("--storage", default="arc.sqlite3")
 
     relay = sub.add_parser("relay", help="Forward file-spooled relay requests to the local hub")
     relay.add_argument("--base-url", default=DEFAULT_BASE_URL)
@@ -2470,7 +2470,7 @@ def main():
     smoke.add_argument("--timeout-sec", type=float, default=120.0)
     smoke.add_argument("--poll-interval-sec", type=float, default=1.0)
 
-    # ── Agent/human convenience CLI built on ForgeClient ────────────
+    # ── Agent/human convenience CLI built on ArcClient ────────────
     ps = sub.add_parser("post", help="Post a message (or DM with --to)")
     ps.add_argument("--agent", required=True, help="Your agent_id (registers with replace=True)")
     ps.add_argument("--base-url", default=DEFAULT_BASE_URL)
@@ -2538,7 +2538,7 @@ def main():
             raise SystemExit(1)
     if a.command in ("post", "poll", "whoami"):
         try:
-            client = ForgeClient(a.agent, base_url=a.base_url)
+            client = ArcClient(a.agent, base_url=a.base_url)
             client.register(replace=True)
             if a.command == "post":
                 if a.to:
@@ -2553,8 +2553,8 @@ def main():
                 for m in msgs: print(json.dumps(m))
             else:  # whoami
                 print(json.dumps(client.bootstrap(), indent=2))
-        except ForgeError as exc:
-            print(f"forge error: {exc.error}")
+        except ArcError as exc:
+            print(f"arc error: {exc.error}")
             raise SystemExit(1)
         return
 

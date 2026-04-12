@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import py_compile; py_compile.compile\\('arc.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python3 -c \"import py_compile; py_compile.compile\\('arc.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(py -3 -c \"import py_compile; py_compile.compile\\('arc.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(py -3 -m pytest tests/ -x -q)",
+      "Bash(py -3 -m unittest discover -s tests -v)",
+      "Bash(python -m pytest tests/ -x -q)",
+      "Bash(python3 -c \"import arc; print\\('import ok'\\)\")",
+      "Bash(py -3 -c \"import arc; print\\('import ok'\\)\")",
+      "Bash(py -3 -c ':*)",
+      "Bash(python arc.py stop)",
+      "Bash(python arc.py ensure)"
+    ]
+  }
+}
