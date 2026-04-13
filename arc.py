@@ -343,10 +343,13 @@ class HubStore:
     def prune_expired_sessions(self, ttl_sec):
         return self.prune_expired(ttl_sec)
 
-    def list_live_agents(self, ttl_sec):
+    def list_live_agents(self, ttl_sec, capability=None):
         self.prune_expired(ttl_sec)
         with self._lk:
-            return [self._ss(r) for r in self._db.execute("SELECT * FROM sessions WHERE active=1 ORDER BY agent_id").fetchall()]
+            agents = [self._ss(r) for r in self._db.execute("SELECT * FROM sessions WHERE active=1 ORDER BY agent_id").fetchall()]
+        if capability:
+            agents = [a for a in agents if capability in a.get("capabilities", [])]
+        return agents
 
     def bootstrap(self, agent_id, ttl_sec):
         """Single-round-trip rehydrate: session, latest visible id, live agents, default channel."""
@@ -369,6 +372,11 @@ class HubStore:
             self._db.commit()
             r = self._db.execute("SELECT * FROM messages WHERE id=?", (cur.lastrowid,)).fetchone()
         return self._mg(r)
+
+    def get_message(self, msg_id):
+        with self._lk:
+            r = self._db.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()
+        return self._mg(r) if r else None
 
     def list_channel_messages(self, ch, since_id=0, limit=100):
         with self._lk:
@@ -679,7 +687,7 @@ class HubStore:
     def _cl(self, r): return {"claim_key":r["claim_key"],"thread_id":r["thread_id"],"task_message_id":r["task_message_id"],"owner_agent_id":r["owner_agent_id"],"claimed_at":r["claimed_at"],"expires_at":r["expires_at"],"released_at":r["released_at"],"metadata":json.loads(r["metadata_json"] or "{}")}
 
 # ── Server ────────────────────────────────────────────────────────────
-MSG_KINDS = {"chat","notice","task","claim","release","artifact"}
+MSG_KINDS = {"chat","notice","task","claim","release","artifact","task_request","task_result","status_update","code_review"}
 ATT_TYPES = {"text","json","code","file_ref","diff_ref"}
 _P = {n: re.compile(p) for n, p in [
     ("sessions", r"^/v1/sessions$"), ("session", r"^/v1/sessions/(?P<id>[^/]+)$"),
@@ -691,7 +699,7 @@ _P = {n: re.compile(p) for n, p in [
     ("locks", r"^/v1/locks$"), ("locks_refresh", r"^/v1/locks/refresh$"), ("locks_rel", r"^/v1/locks/release$"),
     ("tasks", r"^/v1/tasks$"), ("task_complete", r"^/v1/tasks/(?P<id>\d+)/complete$"),
     ("shutdown", r"^/v1/shutdown$"), ("shutdown_cancel", r"^/v1/shutdown/cancel$"),
-    ("network", r"^/v1/network$"), ("root", r"^/$")]}
+    ("stream", r"^/v1/stream$"), ("network", r"^/v1/network$"), ("root", r"^/$")]}
 
 def _norm_msg(p, cfg):
     fa = str(p.get("from_agent","")).strip()
@@ -845,7 +853,7 @@ _ROUTES = {
     ("GET","inbox"):("_h_inbox",None,None),           ("GET","claims"):("_h_list_claims",None,None),
     ("GET","locks"):("_h_list_locks",None,None),      ("GET","tasks"):("_h_list_tasks",None,None),
     ("GET","shutdown"):("_h_shutdown_status",None,None),
-    ("GET","bootstrap"):("_h_bootstrap",None,None),
+    ("GET","bootstrap"):("_h_bootstrap",None,None),  ("GET","stream"):("_h_stream",None,None),
     ("POST","sessions"):("_h_create_session",_S_SESSIONS,None),
     ("POST","channels"):("_h_create_channel",_S_CHANNELS,None),
     ("POST","messages"):("_h_post_message",None,None),
@@ -942,7 +950,9 @@ class _H(BaseHTTPRequestHandler):
 
     # ── GET handlers ──────────────────────────────────────────────────
     def _h_root(self, p, m, q, b):     self._html(DASHBOARD_HTML); return _ALREADY_SENT
-    def _h_agents(self, p, m, q, b):   return {"ok":True,"result":self.server.store.list_live_agents(self.server.cfg.presence_ttl_sec)}
+    def _h_agents(self, p, m, q, b):
+        cap = q.get("capability",[None])[0]
+        return {"ok":True,"result":self.server.store.list_live_agents(self.server.cfg.presence_ttl_sec, capability=cap)}
     def _h_channels(self, p, m, q, b): return {"ok":True,"result":self.server.store.list_channels()}
     def _h_threads(self, p, m, q, b):  return {"ok":True,"result":self.server.store.list_threads()}
     def _h_shutdown_status(self, p, m, q, b): return {"ok":True,"result":self.server.get_shutdown_status()}
@@ -967,6 +977,41 @@ class _H(BaseHTTPRequestHandler):
         ex = q.get("exclude_self",[""])[0].lower() in ("true","1","yes")
         si = _parse_since_id(q); li = _parse_limit(q, cfg.max_query_limit); to = _parse_timeout(q)
         return {"ok":True,"result":_poll_until(lambda: s.list_visible_messages_for_agent(aid, since_id=si, limit=li, channel=ch, thread_id=tid, exclude_self=ex), to)}
+    def _h_stream(self, p, m, q, b):
+        """SSE streaming endpoint — keeps connection open and pushes new messages as server-sent events."""
+        s = self.server.store; cfg = self.server.cfg
+        aid = q.get("agent_id",[None])[0]
+        if not aid: raise ValueError("agent_id query parameter is required")
+        channels = q.get("channels",[None])[0]  # comma-separated
+        ch = None  # filter per-channel in the query if single channel requested
+        if channels and "," not in channels: ch = channels
+        ex = q.get("exclude_self",[""])[0].lower() in ("true","1","yes")
+        si = _parse_since_id(q)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Arc-Instance", self.server.instance_id)
+        self.end_headers()
+        ch_set = set(channels.split(",")) if channels and "," in channels else None
+        last_touch = time.monotonic()
+        try:
+            while True:
+                msgs = s.list_visible_messages_for_agent(aid, since_id=si, limit=50, channel=ch, exclude_self=ex)
+                if ch_set:
+                    msgs = [m for m in msgs if m.get("channel") in ch_set]
+                for msg in msgs:
+                    self.wfile.write(f"data: {json.dumps(msg)}\n\n".encode())
+                    si = max(si, msg["id"])
+                if msgs:
+                    self.wfile.flush()
+                now = time.monotonic()
+                if now - last_touch >= 30:
+                    s.touch_agent_session(aid); last_touch = now
+                time.sleep(0.5)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        return _ALREADY_SENT
     def _h_messages(self, p, m, q, b):
         s = self.server.store; cfg = self.server.cfg
         ch = q.get("channel",[None])[0]; tid = q.get("thread_id",[None])[0]
@@ -1013,8 +1058,15 @@ class _H(BaseHTTPRequestHandler):
         if n["to_agent"] is None and s.get_channel(n["channel"]) is None:
             raise ValueError(f"channel does not exist: {n['channel']}")
         msg = s.create_message(**n)
-        if msg["kind"] == "task":
+        if msg["kind"] in ("task", "task_request"):
             s.create_task(message_id=msg["id"], parent_task_id=ptid, channel=msg["channel"], thread_id=msg["thread_id"])
+        elif msg["kind"] == "task_result" and msg["reply_to"] is not None:
+            orig = s.get_message(msg["reply_to"])
+            if orig and orig["kind"] == "task_request":
+                t = s.get_task(orig["id"])
+                if t and t["status"] == "open":
+                    s.complete_task(orig["id"])
+                    msg["metadata"]["task_completed"] = orig["id"]
         s.touch_agent_session(msg["from_agent"])
         return ({"ok":True,"result":msg}, 201)
     def _h_acquire_claim(self, p, m, q, b):
