@@ -91,7 +91,7 @@ File layout (search for '# ──' section markers to navigate):
 Full protocol specification: docs/PROTOCOL.md
 """
 from __future__ import annotations
-import argparse, hashlib, json, os, re, sqlite3, tempfile, threading, time, uuid
+import argparse, hashlib, json, os, re, select, sqlite3, sys, tempfile, threading, time, uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1782,6 +1782,33 @@ class ArcClient:
     def complete_task(self, task_id: int) -> dict:
         return self._call("POST", f"/v1/tasks/{int(task_id)}/complete", {})["result"]
 
+    @classmethod
+    def quickstart(cls, agent_id: str, base_url: str = DEFAULT_BASE_URL, *,
+                   display_name: str | None = None, capabilities: list[str] | None = None,
+                   timeout: float = 15.0) -> "ArcClient":
+        """Construct, register, and return a ready-to-use client in one call."""
+        c = cls(agent_id, base_url=base_url, timeout=timeout)
+        c.register(display_name=display_name or agent_id, replace=True, capabilities=capabilities)
+        return c
+
+    def call(self, to_agent: str, body: str, *, channel: str = "direct",
+             timeout: float = 30.0, poll_interval: float = 1.0,
+             metadata: dict | None = None) -> dict:
+        """Synchronous agent-to-agent RPC. Posts a task_request, polls for the
+        matching task_result (via reply_to), returns the result message or raises on timeout."""
+        req = self.post(channel, body, kind="task_request", to_agent=to_agent, metadata=metadata)
+        req_id = req["id"]
+        scan_since = max(0, req_id - 1)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            path = f"/v1/messages?channel={urllib.parse.quote(channel)}&since_id={scan_since}&limit=200"
+            msgs = self._call("GET", path)["result"]
+            for m in msgs:
+                if m.get("kind") == "task_result" and m.get("reply_to") == req_id:
+                    return m
+            time.sleep(poll_interval)
+        raise ArcError(f"RPC to {to_agent} timed out after {timeout}s", status=408)
+
 
 class FileRelayServer:
     def __init__(self, config: FileRelayConfig):
@@ -2443,6 +2470,104 @@ setInterval(pollInbox,3000);
 </body>
 </html>"""
 
+# ── MCP Server Adapter ───────────────────────────────────────────────
+# Exposes Arc as an MCP (Model Context Protocol) server over stdio.
+# JSON-RPC 2.0 over stdin/stdout. Implements initialize, tools/list, tools/call.
+
+_MCP_TOOLS = [
+    {"name":"arc_post_message","description":"Post a message to an Arc channel",
+     "inputSchema":{"type":"object","properties":{
+         "channel":{"type":"string"},"body":{"type":"string"},
+         "kind":{"type":"string","default":"chat"},"thread_id":{"type":"string"},
+         "to_agent":{"type":"string"}},"required":["channel","body"]}},
+    {"name":"arc_poll_messages","description":"Poll for new messages from Arc hub",
+     "inputSchema":{"type":"object","properties":{
+         "channel":{"type":"string"},"timeout":{"type":"number","default":5},
+         "thread_id":{"type":"string"}},"required":[]}},
+    {"name":"arc_dm","description":"Send a direct message to another agent",
+     "inputSchema":{"type":"object","properties":{
+         "to_agent":{"type":"string"},"body":{"type":"string"}},
+         "required":["to_agent","body"]}},
+    {"name":"arc_list_agents","description":"List live agents on the Arc hub",
+     "inputSchema":{"type":"object","properties":{},"required":[]}},
+    {"name":"arc_create_channel","description":"Create an Arc channel",
+     "inputSchema":{"type":"object","properties":{
+         "name":{"type":"string"}},"required":["name"]}},
+    {"name":"arc_rpc_call","description":"Send an RPC task_request to another agent and wait for the result",
+     "inputSchema":{"type":"object","properties":{
+         "to_agent":{"type":"string"},"body":{"type":"string"},
+         "timeout":{"type":"number","default":30}},"required":["to_agent","body"]}},
+]
+
+def _mcp_handle_tool(client: ArcClient, name: str, args: dict) -> str:
+    if name == "arc_post_message":
+        r = client.post(args["channel"], args["body"], kind=args.get("kind","chat"),
+                        thread_id=args.get("thread_id"), to_agent=args.get("to_agent"))
+        return json.dumps(r)
+    if name == "arc_poll_messages":
+        msgs = client.poll(timeout=float(args.get("timeout",5)),
+                           channel=args.get("channel"), thread_id=args.get("thread_id"))
+        return json.dumps(msgs)
+    if name == "arc_dm":
+        return json.dumps(client.dm(args["to_agent"], args["body"]))
+    if name == "arc_list_agents":
+        return json.dumps(client._call("GET", "/v1/agents")["result"])
+    if name == "arc_create_channel":
+        return json.dumps(client._call("POST", "/v1/channels", {"name": args["name"]})["result"])
+    if name == "arc_rpc_call":
+        return json.dumps(client.call(args["to_agent"], args["body"], timeout=float(args.get("timeout",30))))
+    raise ValueError(f"unknown tool: {name}")
+
+def run_mcp_server(agent_id: str, base_url: str = DEFAULT_BASE_URL):
+    """Run Arc as an MCP server over stdio (JSON-RPC 2.0)."""
+    client = ArcClient.quickstart(agent_id, base_url)
+    def _write(obj):
+        raw = json.dumps(obj)
+        sys.stdout.write(f"Content-Length: {len(raw)}\r\n\r\n{raw}")
+        sys.stdout.flush()
+    def _respond(req_id, result): _write({"jsonrpc":"2.0","id":req_id,"result":result})
+    def _error(req_id, code, msg): _write({"jsonrpc":"2.0","id":req_id,"error":{"code":code,"message":msg}})
+    buf = ""
+    while True:
+        try:
+            line = sys.stdin.readline()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not line: break
+        buf += line
+        # Parse Content-Length header framing
+        if "\r\n\r\n" not in buf: continue
+        header, rest = buf.split("\r\n\r\n", 1)
+        m = re.search(r"Content-Length:\s*(\d+)", header, re.IGNORECASE)
+        if not m: buf = rest; continue
+        clen = int(m.group(1))
+        while len(rest) < clen:
+            chunk = sys.stdin.read(clen - len(rest))
+            if not chunk: break
+            rest += chunk
+        body_str, buf = rest[:clen], rest[clen:]
+        try: req = json.loads(body_str)
+        except json.JSONDecodeError: continue
+        rid = req.get("id")
+        method = req.get("method","")
+        if method == "initialize":
+            _respond(rid, {"protocolVersion":"2024-11-05","capabilities":{"tools":{}},
+                           "serverInfo":{"name":"arc-mcp","version":__version__}})
+        elif method == "notifications/initialized":
+            pass  # no response needed for notifications
+        elif method == "tools/list":
+            _respond(rid, {"tools": _MCP_TOOLS})
+        elif method == "tools/call":
+            params = req.get("params",{})
+            try:
+                text = _mcp_handle_tool(client, params.get("name",""), params.get("arguments",{}))
+                _respond(rid, {"content":[{"type":"text","text":text}]})
+            except Exception as exc:
+                _respond(rid, {"content":[{"type":"text","text":str(exc)}],"isError":True})
+        elif rid is not None:
+            _error(rid, -32601, f"method not found: {method}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Arc - single-file agent coordination hub")
     sub = ap.add_subparsers(dest="command")
@@ -2482,6 +2607,10 @@ def main():
     relay.add_argument("--spool-dir", default=DEFAULT_SPOOL_DIR)
     relay.add_argument("--poll-interval-sec", type=float, default=0.25)
     relay.add_argument("--request-timeout-sec", type=float, default=30.0)
+
+    mcp = sub.add_parser("mcp", help="Run Arc as an MCP server over stdio")
+    mcp.add_argument("--agent", default="mcp-client", help="Agent ID to register as")
+    mcp.add_argument("--base-url", default=DEFAULT_BASE_URL)
 
     smoke = sub.add_parser("smoke-agent", help="Run a deterministic smoke-test role")
     smoke.add_argument("--role", required=True, choices=("smoke-a", "smoke-b", "smoke-c"))
@@ -2532,6 +2661,12 @@ def main():
         r = reset_hub(storage=a.storage, host=a.host, port=a.port)
         print(json.dumps(r, indent=2))
         raise SystemExit(0 if r.get("reset") else 1)
+    if a.command == "mcp":
+        try:
+            run_mcp_server(agent_id=a.agent, base_url=a.base_url)
+        except KeyboardInterrupt:
+            pass
+        return
     if a.command == "relay":
         cfg = FileRelayConfig(
             base_url=a.base_url,
