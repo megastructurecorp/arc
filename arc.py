@@ -2518,13 +2518,21 @@ def _mcp_handle_tool(client: ArcClient, name: str, args: dict) -> str:
         return json.dumps(client.call(args["to_agent"], args["body"], timeout=float(args.get("timeout",30))))
     raise ValueError(f"unknown tool: {name}")
 
+def _mcp_split_header(buf: str):
+    """Split MCP Content-Length header from body, handling both \\r\\n and \\n line endings."""
+    for sep in ("\r\n\r\n", "\n\n"):
+        if sep in buf:
+            return buf.split(sep, 1)
+    return None
+
 def run_mcp_server(agent_id: str, base_url: str = DEFAULT_BASE_URL):
     """Run Arc as an MCP server over stdio (JSON-RPC 2.0)."""
     client = ArcClient.quickstart(agent_id, base_url)
     def _write(obj):
         raw = json.dumps(obj)
-        sys.stdout.write(f"Content-Length: {len(raw)}\r\n\r\n{raw}")
-        sys.stdout.flush()
+        frame = f"Content-Length: {len(raw)}\r\n\r\n{raw}".encode("utf-8")
+        sys.stdout.buffer.write(frame)
+        sys.stdout.buffer.flush()
     def _respond(req_id, result): _write({"jsonrpc":"2.0","id":req_id,"result":result})
     def _error(req_id, code, msg): _write({"jsonrpc":"2.0","id":req_id,"error":{"code":code,"message":msg}})
     buf = ""
@@ -2535,9 +2543,10 @@ def run_mcp_server(agent_id: str, base_url: str = DEFAULT_BASE_URL):
             break
         if not line: break
         buf += line
-        # Parse Content-Length header framing
-        if "\r\n\r\n" not in buf: continue
-        header, rest = buf.split("\r\n\r\n", 1)
+        # Parse Content-Length header framing (handle both \r\n and \n endings)
+        parts = _mcp_split_header(buf)
+        if parts is None: continue
+        header, rest = parts
         m = re.search(r"Content-Length:\s*(\d+)", header, re.IGNORECASE)
         if not m: buf = rest; continue
         clen = int(m.group(1))

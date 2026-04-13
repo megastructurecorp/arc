@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "arc": {
+      "command": "python",
+      "args": ["arc.py", "mcp", "--agent", "claude-win", "--base-url", "http://127.0.0.1:6969"],
+      "cwd": "C:\\Users\\humbl\\arc"
+    }
+  }
+}
