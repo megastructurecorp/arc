@@ -691,7 +691,7 @@ _P = {n: re.compile(p) for n, p in [
     ("locks", r"^/v1/locks$"), ("locks_refresh", r"^/v1/locks/refresh$"), ("locks_rel", r"^/v1/locks/release$"),
     ("tasks", r"^/v1/tasks$"), ("task_complete", r"^/v1/tasks/(?P<id>\d+)/complete$"),
     ("shutdown", r"^/v1/shutdown$"), ("shutdown_cancel", r"^/v1/shutdown/cancel$"),
-    ("root", r"^/$")]}
+    ("network", r"^/v1/network$"), ("root", r"^/$")]}
 
 def _norm_msg(p, cfg):
     fa = str(p.get("from_agent","")).strip()
@@ -858,6 +858,7 @@ _ROUTES = {
     ("POST","task_complete"):("_h_task_complete",None,None),
     ("POST","shutdown"):("_h_shutdown_initiate",_S_SHUTDOWN,None),
     ("POST","shutdown_cancel"):("_h_shutdown_cancel",None,None),
+    ("POST","network"):("_h_network_toggle",None,None),
 }
 
 class _H(BaseHTTPRequestHandler):
@@ -954,7 +955,10 @@ class _H(BaseHTTPRequestHandler):
         return {"ok":True,"result":{"storage_path":str(s.db_path),"instance_id":self.server.instance_id,
             "journal_mode":s.journal_mode,"wal_mode":s.wal_enabled,"default_channel":"general",
             "max_body_chars":cfg.max_body_chars,"max_attachment_chars":cfg.max_attachment_chars,
-            "max_attachments":cfg.max_attachments}}
+            "max_attachments":cfg.max_attachments,"allow_remote":cfg.allow_remote}}
+    def _h_network_toggle(self, p, m, q, b):
+        if b and "allow_remote" in b: self.server.cfg.allow_remote = bool(b["allow_remote"])
+        return {"ok":True,"result":{"allow_remote":self.server.cfg.allow_remote}}
     def _h_events(self, p, m, q, b):
         s = self.server.store; cfg = self.server.cfg
         aid = q.get("agent_id",[None])[0]; ch = q.get("channel",[None])[0]; tid = q.get("thread_id",[None])[0]
@@ -2112,7 +2116,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
 </div>
 <div id="footer">
   <span id="hub-info"></span>
-  <span style="margin-left:auto"><code>/channels</code> &middot; <code>/channel &lt;name&gt;</code> &middot; <code>/create-channel &lt;name&gt;</code> &middot; <code>/dm &lt;agent&gt; &lt;msg&gt;</code> &middot; <code>/quit [sec]</code></span>
+  <span style="margin-left:auto"><code>/channels</code> &middot; <code>/channel &lt;name&gt;</code> &middot; <code>/create-channel &lt;name&gt;</code> &middot; <code>/dm &lt;agent&gt; &lt;msg&gt;</code> &middot; <code>/network on|off</code> &middot; <code>/quit [sec]</code></span>
 </div>
 <script>
 const NICK_COLORS=['#38bdf8','#34d399','#fbbf24','#f87171','#c084fc','#fb923c','#2dd4bf','#e879f9'];
@@ -2248,67 +2252,34 @@ async function sendMessage(){
   if(!body)return;
   input.value='';
 
-  // /channels — list all channels
   if(/^\/channels$/i.test(body)){
-    try{
-      const r=await fetch('/v1/channels');
-      const j=await r.json();
-      if(j.ok){
-        const names=j.result.map(c=>'#'+c.name).join(', ');
-        showLocalNotice('Channels: '+names);
-      }else{showLocalNotice('Failed to list channels: '+(j.error||'unknown error'));}
-    }catch(e){showLocalNotice('Failed to list channels.');}
+    try{const r=await fetch('/v1/channels');const j=await r.json();if(j.ok)showLocalNotice('Channels: '+j.result.map(c=>'#'+c.name).join(', '));else showLocalNotice('Failed: '+(j.error||'unknown'));}catch(e){showLocalNotice('Failed to list channels.');}
     return;
   }
-
-  // /channel <name> — switch channel
   const chMatch=body.match(/^\/channel\s+(\S+)$/i);
   if(chMatch){
-    const name=chMatch[1].replace(/^#/,'');
-    currentChannel=name;
-    lastId=0;seeded=false;
-    $('feed').innerHTML='<div class="empty">Loading messages...</div>';
-    $('channel-indicator').textContent='#'+name;
-    showLocalNotice('Switched to #'+name);
-    await pollMessages();
-    return;
+    const name=chMatch[1].replace(/^#/,'');currentChannel=name;lastId=0;seeded=false;
+    $('feed').innerHTML='<div class="empty">Loading messages...</div>';$('channel-indicator').textContent='#'+name;
+    showLocalNotice('Switched to #'+name);await pollMessages();return;
   }
-
-  // /dm <agent> <body> — send a direct message to an agent
   const dmMatch=body.match(/^\/dm\s+(\S+)\s+([\s\S]+)$/i);
   if(dmMatch){
     const to=dmMatch[1],dmBody=dmMatch[2];
-    try{
-      const r=await fetch('/v1/messages',{
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({from_agent:'operator',to_agent:to,channel:'direct',kind:'chat',body:dmBody})
-      });
-      const j=await r.json();
-      if(j.ok)showLocalNotice('DM \u2192 '+to+': '+dmBody);
-      else showLocalNotice('DM failed: '+(j.error||'unknown error'));
-    }catch(e){showLocalNotice('DM failed.');}
+    try{const r=await fetch('/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from_agent:'operator',to_agent:to,channel:'direct',kind:'chat',body:dmBody})});const j=await r.json();if(j.ok)showLocalNotice('DM \u2192 '+to+': '+dmBody);else showLocalNotice('DM failed: '+(j.error||'unknown'));}catch(e){showLocalNotice('DM failed.');}
     return;
   }
-
-  // /create-channel <name> — create and switch to channel
   const createMatch=body.match(/^\/create-channel\s+(\S+)$/i);
   if(createMatch){
     const name=createMatch[1].replace(/^#/,'');
-    try{
-      const r=await fetch('/v1/channels',{
-        method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({name:name,created_by:'operator'})
-      });
-      const j=await r.json();
-      if(j.ok){
-        currentChannel=name;
-        lastId=0;seeded=false;
-        $('feed').innerHTML='<div class="empty">Loading messages...</div>';
-        $('channel-indicator').textContent='#'+name;
-        showLocalNotice('Created and switched to #'+name);
-        await pollMessages();
-      }else{showLocalNotice('Failed to create channel: '+(j.error||'unknown error'));}
-    }catch(e){showLocalNotice('Failed to create channel.');}
+    try{const r=await fetch('/v1/channels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,created_by:'operator'})});const j=await r.json();
+      if(j.ok){currentChannel=name;lastId=0;seeded=false;$('feed').innerHTML='<div class="empty">Loading messages...</div>';$('channel-indicator').textContent='#'+name;showLocalNotice('Created and switched to #'+name);await pollMessages();}
+      else showLocalNotice('Failed: '+(j.error||'unknown'));}catch(e){showLocalNotice('Failed to create channel.');}
+    return;
+  }
+
+  const netMatch=body.match(/^\/network\s+(on|off)$/i);
+  if(netMatch){
+    try{const r=await fetch('/v1/network',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({allow_remote:netMatch[1].toLowerCase()==='on'})});const j=await r.json();if(j.ok)showLocalNotice('Network: remote access '+(j.result.allow_remote?'ON':'OFF'));else showLocalNotice('Failed: '+(j.error||'unknown'));}catch(e){showLocalNotice('Network toggle failed.');}
     return;
   }
 
