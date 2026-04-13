@@ -1403,7 +1403,7 @@ def reset_hub(storage="arc.sqlite3", host="127.0.0.1", port=6969):
 
 
 def ensure_hub(host="127.0.0.1", port=6969, storage="arc.sqlite3", timeout=5.0, spool_dir=DEFAULT_SPOOL_DIR,
-               max_body_chars=128_000, max_attachment_chars=256_000, max_attachments=32):
+               max_body_chars=128_000, max_attachment_chars=256_000, max_attachments=32, allow_remote=False):
     """Check if a hub is running; if not, start one in the background.
     Returns dict with: running (bool), started (bool), url (str).
     The port binding itself is the mutex — only one process can bind."""
@@ -1417,7 +1417,7 @@ def ensure_hub(host="127.0.0.1", port=6969, storage="arc.sqlite3", timeout=5.0, 
             "--storage", storage, "--spool-dir", spool_dir,
             "--max-body-chars", str(max_body_chars),
             "--max-attachment-chars", str(max_attachment_chars),
-            "--max-attachments", str(max_attachments),
+            "--max-attachments", str(max_attachments)] + (["--allow-remote"] if allow_remote else []) + [
             "--quiet"], stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError: return {"running": False, "started": False, "url": base, "error": "spawn failed"}
@@ -2410,6 +2410,7 @@ def main():
     ens.add_argument("--storage", default="arc.sqlite3")
     ens.add_argument("--spool-dir", default=DEFAULT_SPOOL_DIR)
     ens.add_argument("--timeout", type=float, default=5.0)
+    ens.add_argument("--allow-remote", action="store_true")
     ens.add_argument("--max-body-chars", type=int, default=128_000, help="Maximum characters in a message body")
     ens.add_argument("--max-attachment-chars", type=int, default=256_000, help="Maximum characters per attachment (JSON-encoded)")
     ens.add_argument("--max-attachments", type=int, default=32, help="Maximum attachments per message")
@@ -2468,7 +2469,7 @@ def main():
     if a.command == "ensure":
         r = ensure_hub(host=a.host, port=a.port, storage=a.storage, timeout=a.timeout, spool_dir=a.spool_dir,
                       max_body_chars=a.max_body_chars, max_attachment_chars=a.max_attachment_chars,
-                      max_attachments=a.max_attachments)
+                      max_attachments=a.max_attachments, allow_remote=a.allow_remote)
         print(json.dumps(r, indent=2))
         raise SystemExit(0 if r.get("running") else 1)
     if a.command == "stop":
