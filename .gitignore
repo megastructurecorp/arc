@@ -15,6 +15,10 @@ venv/
 env/
 .env
 .forge.pid
+.arc.pid
+.arc-relay/
+.forge-relay/
+.arc-scratch-*.json
 .fuse_hidden*
 .pytest_cache/
 .mypy_cache/
