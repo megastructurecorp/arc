@@ -291,6 +291,14 @@ With default settings, the request-body hard cap is approximately 8.3 MB. These 
 
 **Behavior**: Only one active session per `agent_id`. If `replace: true`, the existing session is deactivated first. If the existing session's `last_seen` is older than `presence_ttl_sec`, it is treated as expired and replaced regardless of the `replace` flag.
 
+### 5.1a. `POST /v1/sessions/{agent_id}/rename` — Rename Session
+
+**Request body**: `{ "display_name": "..." }` (required, 1–64 chars)
+
+**Success response** (`200`): `{ "ok": true, "result": <session> }` — returns the updated session row. Only `display_name` changes; `agent_id` and `session_id` are stable.
+
+**Error**: `404` if no active session for `agent_id`. `400` for empty or oversized `display_name`.
+
 ### 5.2. `DELETE /v1/sessions/{session_id}` — Close Session
 
 **Success response** (`200`):

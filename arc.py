@@ -317,6 +317,18 @@ class HubStore:
              "created_at": iso, "last_seen": iso, "active": True}
         return s, deact
 
+    def rename_session(self, agent_id, display_name):
+        with self._lk:
+            cur = self._db.execute(
+                "UPDATE sessions SET display_name=?, last_seen=? WHERE agent_id=? AND active=1",
+                (display_name, _to_iso(_utcnow()), agent_id))
+            self._db.commit()
+            if cur.rowcount == 0: return None
+            r = self._db.execute(
+                "SELECT * FROM sessions WHERE agent_id=? AND active=1 ORDER BY created_at DESC LIMIT 1",
+                (agent_id,)).fetchone()
+        return self._ss(r) if r else None
+
     def get_session(self, sid):
         with self._lk: r = self._db.execute("SELECT * FROM sessions WHERE session_id=?", (sid,)).fetchone()
         return self._ss(r) if r else None
@@ -691,6 +703,7 @@ MSG_KINDS = {"chat","notice","task","claim","release","artifact","task_request",
 ATT_TYPES = {"text","json","code","file_ref","diff_ref"}
 _P = {n: re.compile(p) for n, p in [
     ("sessions", r"^/v1/sessions$"), ("session", r"^/v1/sessions/(?P<id>[^/]+)$"),
+    ("session_rename", r"^/v1/sessions/(?P<id>[^/]+)/rename$"),
     ("agents", r"^/v1/agents$"), ("channels", r"^/v1/channels$"), ("hub_info", r"^/v1/hub-info$"),
     ("events", r"^/v1/events$"), ("messages", r"^/v1/messages$"), ("bootstrap", r"^/v1/bootstrap$"),
     ("threads", r"^/v1/threads$"), ("thread", r"^/v1/threads/(?P<id>[^/]+)$"),
@@ -836,6 +849,7 @@ def _validate(body, spec):
 # body_spec is a tuple of (name, type, required, validator?) tuples consumed by _validate.
 # None means the handler owns its own parsing (GET queries, orchestration-heavy POSTs).
 _S_SESSIONS   = (("agent_id",str,True),("display_name",str,False),("capabilities",list,False),("metadata",dict,False),("replace",bool,False))
+_S_SESSION_RENAME = (("display_name",str,True),)
 _S_CHANNELS   = (("name",str,True),("created_by",str,False),("metadata",dict,False))
 _S_CLAIMS     = (("owner_agent_id",str,True),("claim_key",str,False),("task_message_id",int,False),("thread_id",str,False),("ttl_sec",int,False,_v_ttl),("metadata",dict,False))
 _S_CLAIMS_RFR = (("claim_key",str,True),("owner_agent_id",str,True),("ttl_sec",int,False,_v_ttl))
@@ -855,6 +869,7 @@ _ROUTES = {
     ("GET","shutdown"):("_h_shutdown_status",None,None),
     ("GET","bootstrap"):("_h_bootstrap",None,None),  ("GET","stream"):("_h_stream",None,None),
     ("POST","sessions"):("_h_create_session",_S_SESSIONS,None),
+    ("POST","session_rename"):("_h_rename_session",_S_SESSION_RENAME,None),
     ("POST","channels"):("_h_create_channel",_S_CHANNELS,None),
     ("POST","messages"):("_h_post_message",None,None),
     ("POST","claims"):("_h_acquire_claim",_S_CLAIMS,"owner_agent_id"),
@@ -952,6 +967,8 @@ class _H(BaseHTTPRequestHandler):
     def _h_root(self, p, m, q, b):     self._html(DASHBOARD_HTML); return _ALREADY_SENT
     def _h_agents(self, p, m, q, b):
         cap = q.get("capability",[None])[0]
+        aid = q.get("as",[None])[0]
+        if aid: self.server.store.touch_agent_session(aid)
         return {"ok":True,"result":self.server.store.list_live_agents(self.server.cfg.presence_ttl_sec, capability=cap)}
     def _h_channels(self, p, m, q, b): return {"ok":True,"result":self.server.store.list_channels()}
     def _h_threads(self, p, m, q, b):  return {"ok":True,"result":self.server.store.list_threads()}
@@ -1045,6 +1062,13 @@ class _H(BaseHTTPRequestHandler):
             [str(c) for c in p.get("capabilities",[])], p.get("metadata",{}),
             bool(p.get("replace",False)), self.server.cfg.presence_ttl_sec)
         return ({"ok":True,"result":sess}, 201)
+    def _h_rename_session(self, p, m, q, b):
+        dn = p["display_name"].strip()
+        if not dn: raise ValueError("display_name must not be empty")
+        if len(dn) > 64: raise ValueError("display_name must be 64 characters or fewer")
+        sess = self.server.store.rename_session(m.group("id"), dn)
+        if sess is None: return ({"ok":False,"error":"no active session for agent_id"}, 404)
+        return ({"ok":True,"result":sess}, 200)
     def _h_create_channel(self, p, m, q, b):
         ch, created = self.server.store.create_channel(p["name"], p.get("created_by"), p.get("metadata",{}))
         return ({"ok":True,"result":ch}, 201 if created else 200)
@@ -2145,7 +2169,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
 .msg{font-size:.82rem;line-height:1.5;word-wrap:break-word}
 .msg-time{color:#475569;margin-right:.4rem;font-size:.75rem}
 .msg-from{font-weight:600;margin-right:.3rem}
-.msg-operator .msg-from{color:#38bdf8}
+.msg-self .msg-from{color:#38bdf8}
 .msg-system{color:#64748b;font-style:italic}
 .badge{display:inline-block;padding:.05rem .35rem;border-radius:.2rem;font-size:.65rem;
   font-weight:600;margin-right:.3rem;vertical-align:middle}
@@ -2174,6 +2198,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
   <h1>Arc</h1>
   <span class="dot dot-green" id="status-dot"></span>
   <span id="status-text">Connecting...</span>
+  <span id="me-name" style="font-size:.75rem;color:#64748b;margin-left:.5rem">operator</span>
   <span id="channel-indicator" style="margin-left:.7rem;color:#94a3b8;font-size:.85rem;font-weight:400">#general</span>
   <select id="thread-picker" style="margin-left:.7rem;background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:.25rem;padding:.15rem .3rem;font-size:.78rem">
     <option value="">(all channel messages)</option>
@@ -2195,11 +2220,69 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
 </div>
 <div id="footer">
   <span id="hub-info"></span>
-  <span style="margin-left:auto"><code>/channels</code> &middot; <code>/channel &lt;name&gt;</code> &middot; <code>/create-channel &lt;name&gt;</code> &middot; <code>/dm &lt;agent&gt; &lt;msg&gt;</code> &middot; <code>/network on|off</code> &middot; <code>/quit [sec]</code></span>
+  <span style="margin-left:auto"><code>/channels</code> &middot; <code>/channel &lt;name&gt;</code> &middot; <code>/create-channel &lt;name&gt;</code> &middot; <code>/dm &lt;agent&gt; &lt;msg&gt;</code> &middot; <code>/nick &lt;name&gt;</code> &middot; <code>/network on|off</code> &middot; <code>/quit [sec]</code></span>
 </div>
 <script>
 const NICK_COLORS=['#38bdf8','#34d399','#fbbf24','#f87171','#c084fc','#fb923c','#2dd4bf','#e879f9'];
 let lastId=0,seeded=false,currentChannel='general',currentThread=null,inboxLastId=0;
+let currentAgent='operator';
+let currentDisplay='operator';
+let agentNameMap={};
+
+async function tryRegister(agentId,display,replace){
+  try{
+    const r=await fetch('/v1/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({agent_id:agentId,display_name:display,replace:replace})});
+    return {status:r.status,body:await r.json().catch(()=>({}))};
+  }catch(e){return {status:0,body:{}};}
+}
+
+async function bootstrapIdentity(){
+  let stored=null,storedDisplay=null;
+  try{stored=localStorage.getItem('arcAgentId');}catch(e){}
+  try{storedDisplay=localStorage.getItem('arcDisplayName');}catch(e){}
+  const display=storedDisplay||'operator';
+  if(stored){
+    const r=await tryRegister(stored,display,true);
+    if(r.body&&r.body.ok){setIdentity(r.body.result);return;}
+  }
+  let r=await tryRegister('operator',display,false);
+  if(r.status===409){
+    const id='operator-'+Math.random().toString(36).slice(2,6);
+    r=await tryRegister(id,display,false);
+  }
+  if(r.body&&r.body.ok)setIdentity(r.body.result);
+}
+
+function setIdentity(sess){
+  currentAgent=sess.agent_id;
+  currentDisplay=sess.display_name||sess.agent_id;
+  try{localStorage.setItem('arcAgentId',currentAgent);}catch(e){}
+  try{localStorage.setItem('arcDisplayName',currentDisplay);}catch(e){}
+  const el=$('me-name');if(el)el.textContent=currentDisplay;
+}
+
+function displayNameFor(agentId){return agentNameMap[agentId]||agentId;}
+
+async function renameMe(newName){
+  newName=(newName||'').trim();
+  if(!newName||newName===currentDisplay)return;
+  try{
+    const r=await fetch('/v1/sessions/'+encodeURIComponent(currentAgent)+'/rename',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({display_name:newName})});
+    const j=await r.json();
+    if(j.ok){
+      currentDisplay=j.result.display_name;
+      try{localStorage.setItem('arcDisplayName',currentDisplay);}catch(e){}
+      const el=$('me-name');if(el)el.textContent=currentDisplay;
+      await pollAgents();
+      showLocalNotice('You are now known as '+currentDisplay);
+    }else{
+      showLocalNotice('Rename failed: '+(j.error||'unknown'));
+    }
+  }catch(e){showLocalNotice('Rename failed.');}
+}
 
 function $(id){return document.getElementById(id)}
 function esc(s){if(s==null)return'';const d=document.createElement('div');d.textContent=String(s);return d.innerHTML}
@@ -2221,17 +2304,17 @@ function appendMessages(msgs){
   for(const m of msgs){
     const div=document.createElement('div');
     div.className='msg';
-    const isOp=m.from_agent==='operator';
+    const isMe=m.from_agent===currentAgent;
     const isSys=m.from_agent==='system';
-    if(isOp)div.classList.add('msg-operator');
+    if(isMe)div.classList.add('msg-self');
     if(isSys)div.classList.add('msg-system');
     let kindBadge='';
     if(m.kind&&m.kind!=='chat'){
       kindBadge='<span class="badge badge-'+esc(m.kind)+'">'+esc(m.kind)+'</span>';
     }
-    const color=isOp?'#38bdf8':isSys?'#64748b':nickColor(m.from_agent);
+    const color=isMe?'#38bdf8':isSys?'#64748b':nickColor(m.from_agent);
     div.innerHTML='<span class="msg-time">'+timeFmt(m.ts)+'</span>'
-      +'<span class="msg-from" style="color:'+color+'">'+esc(m.from_agent)+'</span>'
+      +'<span class="msg-from" style="color:'+color+'">'+esc(displayNameFor(m.from_agent))+'</span>'
       +kindBadge+esc(m.body);
     f.appendChild(div);
     if(m.id>lastId)lastId=m.id;
@@ -2273,9 +2356,13 @@ async function pollMessages(){
 
 async function pollAgents(){
   try{
-    const r=await fetch('/v1/agents');
+    const r=await fetch('/v1/agents?as='+encodeURIComponent(currentAgent));
     const j=await r.json();
-    if(j.ok)renderAgents(j.result);
+    if(j.ok){
+      agentNameMap={};
+      for(const a of j.result) agentNameMap[a.agent_id]=a.display_name||a.agent_id;
+      renderAgents(j.result);
+    }
   }catch(e){}
 }
 
@@ -2331,6 +2418,11 @@ async function sendMessage(){
   if(!body)return;
   input.value='';
 
+  const nickMatch=body.match(/^\/nick\s+(.+)$/i);
+  if(nickMatch){
+    await renameMe(nickMatch[1]);
+    return;
+  }
   if(/^\/channels$/i.test(body)){
     try{const r=await fetch('/v1/channels');const j=await r.json();if(j.ok)showLocalNotice('Channels: '+j.result.map(c=>'#'+c.name).join(', '));else showLocalNotice('Failed: '+(j.error||'unknown'));}catch(e){showLocalNotice('Failed to list channels.');}
     return;
@@ -2344,13 +2436,13 @@ async function sendMessage(){
   const dmMatch=body.match(/^\/dm\s+(\S+)\s+([\s\S]+)$/i);
   if(dmMatch){
     const to=dmMatch[1],dmBody=dmMatch[2];
-    try{const r=await fetch('/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from_agent:'operator',to_agent:to,channel:'direct',kind:'chat',body:dmBody})});const j=await r.json();if(j.ok)showLocalNotice('DM \u2192 '+to+': '+dmBody);else showLocalNotice('DM failed: '+(j.error||'unknown'));}catch(e){showLocalNotice('DM failed.');}
+    try{const r=await fetch('/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from_agent:currentAgent,to_agent:to,channel:'direct',kind:'chat',body:dmBody})});const j=await r.json();if(j.ok)showLocalNotice('DM \u2192 '+to+': '+dmBody);else showLocalNotice('DM failed: '+(j.error||'unknown'));}catch(e){showLocalNotice('DM failed.');}
     return;
   }
   const createMatch=body.match(/^\/create-channel\s+(\S+)$/i);
   if(createMatch){
     const name=createMatch[1].replace(/^#/,'');
-    try{const r=await fetch('/v1/channels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,created_by:'operator'})});const j=await r.json();
+    try{const r=await fetch('/v1/channels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,created_by:currentAgent})});const j=await r.json();
       if(j.ok){currentChannel=name;lastId=0;seeded=false;$('feed').innerHTML='<div class="empty">Loading messages...</div>';$('channel-indicator').textContent='#'+name;showLocalNotice('Created and switched to #'+name);await pollMessages();}
       else showLocalNotice('Failed: '+(j.error||'unknown'));}catch(e){showLocalNotice('Failed to create channel.');}
     return;
@@ -2390,7 +2482,7 @@ async function sendMessage(){
     await fetch('/v1/messages',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({from_agent:'operator',channel:currentChannel,kind:'chat',body:body})
+      body:JSON.stringify({from_agent:currentAgent,channel:currentChannel,kind:'chat',body:body})
     });
     await pollMessages();
   }catch(e){
@@ -2434,13 +2526,13 @@ function renderInbox(msgs){
   if(box.querySelector('.empty'))box.innerHTML='';
   for(const m of msgs){
     const div=document.createElement('div');
-    div.className='msg msg-operator';
+    div.className='msg msg-self';
     div.style.cursor='pointer';
     div.title='Click to reply with /dm';
     div.dataset.from=m.from_agent;
     const color=nickColor(m.from_agent);
     div.innerHTML='<span class="msg-time">'+timeFmt(m.ts)+'</span>'
-      +'<span class="msg-from" style="color:'+color+'">'+esc(m.from_agent)+' &rarr; you</span>'
+      +'<span class="msg-from" style="color:'+color+'">'+esc(displayNameFor(m.from_agent))+' &rarr; you</span>'
       +esc(m.body);
     box.appendChild(div);
     if(m.id>inboxLastId)inboxLastId=m.id;
@@ -2449,18 +2541,20 @@ function renderInbox(msgs){
 }
 async function pollInbox(){
   try{
-    const r=await fetch('/v1/inbox/operator?since_id='+inboxLastId);
+    const r=await fetch('/v1/inbox/'+encodeURIComponent(currentAgent)+'?since_id='+inboxLastId);
     const j=await r.json();
     if(j.ok&&j.result.length)renderInbox(j.result);
   }catch(e){}
 }
 
-pollMessages();
-pollAgents();
-loadHubInfo();
-loadThreads();
-pollInbox();
-pollShutdownStatus();
+bootstrapIdentity().then(async()=>{
+  await pollAgents();
+  pollMessages();
+  loadHubInfo();
+  loadThreads();
+  pollInbox();
+  pollShutdownStatus();
+});
 setInterval(pollMessages,3000);
 setInterval(pollAgents,5000);
 setInterval(pollShutdownStatus,5000);
