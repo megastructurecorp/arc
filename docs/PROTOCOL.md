@@ -1,1297 +1,1189 @@
 # Arc Protocol Specification v1
 
-**Status**: Stable draft — all endpoints implemented and tested  
-**Transport**: HTTP/1.1 JSON  
-**Storage**: SQLite 3 (WAL mode)  
-**Dependencies**: Python 3.10+ standard library (reference implementation)
+Status: Stable draft
+Primary transport: HTTP/1.1 with JSON payloads
+Reference implementation: `arc.py` in this repository
 
-This document is the complete specification for the Arc agent coordination protocol. Any implementation that conforms to the endpoint contracts, JSON shapes, and state machines described here is a compatible Arc hub. An agent can build one from this spec alone.
+This document defines the Arc coordination protocol in language-neutral terms.
+Its goal is to be strong enough that an engineer can implement a compatible Arc
+hub in Rust, Go, or another language without reading the Python source.
 
----
+This document intentionally separates:
 
-## Table of Contents
+- normative protocol requirements: required for interoperability
+- optional bindings and admin surfaces: compatible extensions, but not required
+- reference implementation notes: provided only in appendices
 
-1. [Overview](#1-overview)
-2. [Data Model](#2-data-model)
-3. [SQLite Schema](#3-sqlite-schema)
-4. [Bootstrapping](#4-bootstrapping)
-5. [Endpoints](#5-endpoints)
-6. [Error Shape](#6-error-shape)
-7. [Session Lifecycle](#7-session-lifecycle)
-8. [Claims State Machine](#8-claims-state-machine)
-9. [Polling Convention](#9-polling-convention)
-10. [Message Kinds & Conventions](#10-message-kinds--conventions)
-11. [Attachment Types](#11-attachment-types)
-12. [Task Workflow](#12-task-workflow)
-13. [File Locks](#13-file-locks)
-14. [Structured Subtasks](#14-structured-subtasks)
-15. [Hub Discovery & PID File](#15-hub-discovery--pid-file)
-16. [Live Dashboard](#16-live-dashboard)
-17. [Orchestration CLI](#17-orchestration-cli)
-18. [Interop Contract](#18-interop-contract)
-19. [Build Your Own](#19-build-your-own)
+## 1. Scope
 
----
+Arc is a local-first coordination protocol for multi-agent systems. It provides:
 
-## 1. Overview
+- sessions and presence
+- channels and messages
+- direct messages and inbox views
+- claims and file locks with TTL-based leases
+- tasks and parent-child task trees
+- thread summaries and thread detail views
+- polling and long-poll message delivery
 
-Arc is a local-first HTTP + SQLite coordination service for multi-agent systems. It provides:
+The following keywords are normative in this document: MUST, MUST NOT, SHOULD,
+SHOULD NOT, and MAY.
 
-- **Sessions**: Agent presence tracking with TTL-based expiry
-- **Channels**: Named message streams (broadcast)
-- **Messages**: Typed, threaded, with inline or reference attachments
-- **Inbox**: Per-agent direct message delivery
-- **Claims**: Atomic task ownership with TTL, refresh, and release
-- **File Locks**: Per-file advisory locks to prevent edit conflicts
-- **Structured Subtasks**: Parent-child task trees with completion rollup
-- **PID File Discovery**: Automatic hub discovery via `.arc.pid`
-- **Live Dashboard**: Auto-refreshing HTML dashboard at `GET /`
+### 1.1 Conformance Profiles
 
-Agents interact exclusively via HTTP JSON requests. There is no WebSocket, no long-polling, and no push — agents poll with `since_id` for new messages.
+A conforming Arc hub MUST implement the core HTTP profile:
 
-The hub binds to `127.0.0.1:6969` by default. All data persists in a single SQLite file (`arc.sqlite3`).
+- `POST /v1/sessions`
+- `POST /v1/sessions/{agent_id}/rename`
+- `DELETE /v1/sessions/{session_id}`
+- `GET /v1/agents`
+- `GET /v1/channels`
+- `POST /v1/channels`
+- `GET /v1/hub-info`
+- `POST /v1/messages`
+- `GET /v1/messages`
+- `GET /v1/events`
+- `GET /v1/bootstrap`
+- `GET /v1/inbox/{agent_id}`
+- `GET /v1/threads`
+- `GET /v1/threads/{thread_id}`
+- `POST /v1/claims`
+- `POST /v1/claims/refresh`
+- `POST /v1/claims/release`
+- `GET /v1/claims`
+- `POST /v1/locks`
+- `POST /v1/locks/refresh`
+- `POST /v1/locks/release`
+- `GET /v1/locks`
+- `GET /v1/tasks`
+- `POST /v1/tasks/{task_id}/complete`
 
----
+The following shipped surfaces are optional for baseline conformance:
 
-## 2. Data Model
+- `GET /v1/stream` (server-sent events binding)
+- `GET /` (HTML dashboard)
+- `GET /v1/shutdown`
+- `POST /v1/shutdown`
+- `POST /v1/shutdown/cancel`
+- `POST /v1/network`
+- file relay binding described in Appendix B
 
-### Channel
+Clients that depend on optional bindings or optional behaviors SHOULD detect
+support by reading the `features` array in `GET /v1/hub-info` (see §6.3),
+rather than probing endpoints or relying on deployment assumptions.
 
-| Field        | Type   | Notes                     |
-|--------------|--------|---------------------------|
-| `name`       | string | Primary key               |
-| `created_at` | string | ISO 8601 UTC              |
-| `created_by` | string | Nullable                  |
-| `metadata`   | object | Arbitrary JSON, default `{}` |
+## 2. Trust Model
 
-### Session
+Arc v1 has no built-in authentication or authorization.
 
-| Field          | Type    | Notes                              |
-|----------------|---------|-------------------------------------|
-| `session_id`   | string  | UUID v4, primary key                |
-| `agent_id`     | string  | One active session per agent        |
-| `display_name` | string  | Defaults to `agent_id`              |
-| `capabilities` | array   | List of strings                     |
-| `metadata`     | object  | Arbitrary JSON                      |
-| `created_at`   | string  | ISO 8601 UTC                        |
-| `last_seen`    | string  | ISO 8601 UTC, updated on activity   |
-| `active`       | boolean | `false` when closed/expired/replaced |
+A conforming implementation MUST document this clearly. The protocol assumes a
+local-trust deployment model:
 
-### Message
+- loopback-only access is the safe default
+- network exposure is an operator decision
+- remote access controls, TLS, and auth are out of scope for v1
 
-| Field         | Type    | Notes                              |
-|---------------|---------|-------------------------------------|
-| `id`          | integer | Auto-increment, primary key         |
-| `ts`          | string  | ISO 8601 UTC                        |
-| `from_agent`  | string  | Required                            |
-| `to_agent`    | string  | Nullable — if set, message is direct |
-| `channel`     | string  | Defaults to `"general"` or `"direct"` |
-| `kind`        | string  | One of: `chat`, `notice`, `task`, `claim`, `release`, `artifact` |
-| `body`        | string  | Text body (max 128,000 chars default, configurable) |
-| `attachments` | array   | List of attachment objects (max 32 default, configurable) |
-| `reply_to`    | integer | Nullable — references another `id`  |
-| `thread_id`   | string  | Nullable — groups messages           |
-| `metadata`    | object  | Arbitrary JSON                       |
+If an implementation exposes Arc beyond a trusted local boundary, that
+implementation MUST treat security hardening as an extension beyond the base
+protocol.
 
-### Claim
+## 3. Common Wire Rules
 
-| Field             | Type    | Notes                              |
-|-------------------|---------|-------------------------------------|
-| `claim_key`       | string  | Primary key                         |
-| `thread_id`       | string  | Nullable                            |
-| `task_message_id` | integer | Nullable — links to a message `id`  |
-| `owner_agent_id`  | string  | Current holder                      |
-| `claimed_at`      | string  | ISO 8601 UTC                        |
-| `expires_at`      | string  | ISO 8601 UTC                        |
-| `released_at`     | string  | Nullable — set on release           |
-| `metadata`        | object  | Arbitrary JSON                      |
+### 3.1 Encodings and Media Types
 
-### Lock
+- All JSON requests and responses MUST use UTF-8.
+- JSON endpoints MUST accept and return `application/json`.
+- `GET /` returns HTML.
+- `GET /v1/stream` returns `text/event-stream`.
 
-| Field         | Type    | Notes                              |
-|---------------|---------|-------------------------------------|
-| `file_path`   | string  | Primary key — path being locked     |
-| `agent_id`    | string  | Current holder                      |
-| `locked_at`   | string  | ISO 8601 UTC                        |
-| `expires_at`  | string  | ISO 8601 UTC                        |
-| `released_at` | string  | Nullable — set on release           |
-| `metadata`    | object  | Arbitrary JSON                      |
+### 3.2 Success and Error Envelopes
 
-### Task
+All JSON success responses MUST use:
 
-| Field            | Type    | Notes                                       |
-|------------------|---------|----------------------------------------------|
-| `task_id`        | integer | Primary key — equals the message `id`        |
-| `parent_task_id` | integer | Nullable — references parent task            |
-| `channel`        | string  | Channel the task message was posted on       |
-| `thread_id`      | string  | Nullable — thread grouping key               |
-| `status`         | string  | `"open"` or `"done"`                         |
-| `created_at`     | string  | ISO 8601 UTC                                 |
-| `completed_at`   | string  | Nullable — set when marked done              |
-
----
-
-## 3. SQLite Schema
-
-Copy-paste these statements to create a compatible database:
-
-```sql
-PRAGMA journal_mode=WAL;
-
-CREATE TABLE IF NOT EXISTS channels (
-    name         TEXT PRIMARY KEY,
-    created_at   TEXT NOT NULL,
-    created_by   TEXT,
-    metadata_json TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts               TEXT NOT NULL,
-    from_agent       TEXT NOT NULL,
-    to_agent         TEXT,
-    channel          TEXT NOT NULL,
-    kind             TEXT NOT NULL,
-    body             TEXT NOT NULL,
-    attachments_json TEXT NOT NULL DEFAULT '[]',
-    reply_to         INTEGER,
-    thread_id        TEXT,
-    metadata_json    TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE INDEX IF NOT EXISTS idx_messages_channel_id   ON messages(channel, id);
-CREATE INDEX IF NOT EXISTS idx_messages_to_agent_id  ON messages(to_agent, id);
-CREATE INDEX IF NOT EXISTS idx_messages_thread_id    ON messages(thread_id, id);
-
-CREATE TABLE IF NOT EXISTS sessions (
-    session_id        TEXT PRIMARY KEY,
-    agent_id          TEXT NOT NULL,
-    display_name      TEXT NOT NULL,
-    capabilities_json TEXT NOT NULL DEFAULT '[]',
-    metadata_json     TEXT NOT NULL DEFAULT '{}',
-    created_at        TEXT NOT NULL,
-    last_seen         TEXT NOT NULL,
-    active            INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE INDEX IF NOT EXISTS idx_sessions_agent        ON sessions(agent_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_active       ON sessions(active, last_seen);
-
-CREATE TABLE IF NOT EXISTS claims (
-    claim_key       TEXT PRIMARY KEY,
-    thread_id       TEXT,
-    task_message_id INTEGER,
-    owner_agent_id  TEXT NOT NULL,
-    claimed_at      TEXT NOT NULL,
-    expires_at      TEXT NOT NULL,
-    released_at     TEXT,
-    metadata_json   TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE INDEX IF NOT EXISTS idx_claims_thread_id ON claims(thread_id);
-
-CREATE TABLE IF NOT EXISTS locks (
-    file_path     TEXT PRIMARY KEY,
-    agent_id      TEXT NOT NULL,
-    locked_at     TEXT NOT NULL,
-    expires_at    TEXT NOT NULL,
-    released_at   TEXT,
-    metadata_json TEXT NOT NULL DEFAULT '{}'
-);
-
-CREATE INDEX IF NOT EXISTS idx_locks_agent_id ON locks(agent_id);
-
-CREATE TABLE IF NOT EXISTS tasks (
-    task_id        INTEGER PRIMARY KEY,
-    parent_task_id INTEGER,
-    channel        TEXT NOT NULL,
-    thread_id      TEXT,
-    status         TEXT NOT NULL DEFAULT 'open',
-    created_at     TEXT NOT NULL,
-    completed_at   TEXT,
-    FOREIGN KEY (parent_task_id) REFERENCES tasks(task_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+```json
+{ "ok": true, "result": {} }
 ```
 
-**JSON storage**: Fields ending in `_json` store serialized JSON. The API always returns them parsed: `metadata_json` → `metadata`, `attachments_json` → `attachments`, `capabilities_json` → `capabilities`.
+All JSON error responses MUST use:
 
----
+```json
+{ "ok": false, "error": "human-readable message" }
+```
 
-## 4. Bootstrapping
+Claim and lock acquire/refresh endpoints add:
 
-On startup, a conforming hub MUST:
+```json
+{ "ok": true, "acquired": true, "result": {} }
+```
 
-1. Initialize the SQLite schema (create tables and indexes if not present)
-2. Attempt to enable SQLite WAL mode
-3. Ensure default channels exist: `"general"` and `"direct"` (INSERT OR IGNORE)
+or:
 
-Stale sessions are filtered by TTL and background pruning. A hub MUST NOT globally deactivate all sessions on startup because that breaks shared-filesystem deployments where multiple hub processes point at the same database.
+```json
+{ "ok": true, "acquired": false, "result": {} }
+```
 
----
+### 3.3 Response Header
 
-## 5. Endpoints
+JSON and streaming responses SHOULD include `X-Arc-Instance`.
 
-All JSON endpoints accept and return `Content-Type: application/json`.
+`X-Arc-Instance` identifies the backing coordination state, not merely the
+serving process. Clients MAY use it to detect that they are speaking to a
+different Arc instance than before.
 
-Conforming hubs SHOULD include an `X-Arc-Instance` response header on every response. The value is an opaque, stable identifier for the underlying hub database so clients can detect when they have silently started talking to a different Arc instance.
+### 3.4 POST Body Parsing
 
-### Shared POST Parsing Rules
+All POST endpoints share these rules:
 
-All POST endpoints apply these guards before dispatching to the handler:
+- the request body MUST decode as UTF-8
+- the request body MUST be valid JSON
+- the decoded JSON value MUST be an object
+- oversized request bodies MUST be rejected with `400`
 
-- `Content-Length` must be an integer >= 0
-- Request bodies larger than `max_body_chars + (max_attachment_chars * max_attachments) + 65536` are rejected with `400`
-- Malformed JSON returns `400`
-- A valid JSON payload must decode to an object, not an array, string, number, or boolean
+The reference implementation derives the effective request size cap from:
 
-With default settings, the request-body hard cap is approximately 8.3 MB. These limits are configurable via `--max-body-chars`, `--max-attachment-chars`, and `--max-attachments` CLI arguments; query `GET /v1/hub-info` for active values.
+- `max_body_chars`
+- `max_attachment_chars`
+- `max_attachments`
 
-### 5.1. `POST /v1/sessions` — Create Session
+Clients SHOULD inspect `GET /v1/hub-info` for the active configured limits.
 
-**Request body**:
+### 3.5 Scalars and Timestamps
+
+- timestamps MUST be emitted in UTC with a trailing `Z`
+- emitters MAY use sub-second precision; parsers MUST accept any RFC 3339 UTC
+  timestamp
+- `id`, `reply_to`, `task_id`, `parent_task_id`, and all other numeric cursors
+  MUST be signed 64-bit integers on the wire
+- a conforming hub MUST NOT mint an `id` value greater than `9007199254740991`
+  (2^53 − 1)
+- this cap exists so that clients whose JSON parsers use IEEE 754 double-
+  precision floats (notably JavaScript, and any language binding that parses
+  JSON numbers as `double` by default) can represent every `id` exactly
+- the reference hub starts message ids at 1 and autoincrements; the 2^53 − 1
+  cap represents roughly nine quadrillion messages and is not a practical
+  limit on any v1 deployment
+- a hub that approaches the cap SHOULD alert operators rather than silently
+  wrap or truncate; a hub that exhausts the cap MUST refuse to mint further
+  ids with HTTP `500` rather than roll over
+
+Clients MUST NOT assume that `id` values are dense, gap-free, or monotonically
+adjacent. Clients MUST treat `id` only as an opaque monotonically-increasing
+cursor, and MUST use `since_id` rather than counting or arithmetic.
+
+### 3.6 Query Parameter Conventions
+
+Arc uses a few common query parameter patterns:
+
+- `since_id`: inclusive floor is not used; responses contain items with
+  `id > since_id`
+- `limit`: hubs MAY clamp to an implementation-defined maximum
+- `timeout`: long-poll wait in seconds, clamped by the hub
+- boolean flags accept `true`, `1`, or `yes` as truthy in the reference
+  implementation
+
+### 3.7 Long-Poll Timeout Invariant
+
+If a client calls a long-polling endpoint with `timeout=N`, the client's own
+HTTP read timeout MUST be greater than `N`.
+
+Clients SHOULD use a safety margin of at least 5 seconds. Otherwise they risk
+observing a local socket timeout before the hub completes the long-poll window.
+
+### 3.8 Presence During Passive Waits
+
+A conforming hub MUST treat active long-poll participation as presence activity.
+
+In practice this means that a session MUST NOT expire solely because the agent
+is blocked in an active `GET /v1/events?...&timeout=N` loop. Presence and
+participation must not diverge.
+
+## 4. Data Model
+
+### 4.1 Channel
+
+| Field | Type | Notes |
+|---|---|---|
+| `name` | string | Primary identifier |
+| `created_at` | string | UTC timestamp |
+| `created_by` | string or null | Creator id |
+| `metadata` | object | Arbitrary JSON object |
+
+### 4.2 Session
+
+| Field | Type | Notes |
+|---|---|---|
+| `session_id` | string | UUID-like opaque id |
+| `agent_id` | string | Logical agent name |
+| `display_name` | string | Human-readable label |
+| `capabilities` | array of strings | Capability membership |
+| `metadata` | object | Arbitrary JSON object |
+| `created_at` | string | UTC timestamp |
+| `last_seen` | string | UTC timestamp |
+| `active` | boolean | False when inactive |
+
+The one-active-session-per-agent invariant is protocol-level, not schema-level.
+A hub MAY enforce it in application logic rather than via a unique database
+constraint.
+
+### 4.3 Message
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | integer | Monotonic message id |
+| `ts` | string | UTC timestamp |
+| `from_agent` | string | Required |
+| `to_agent` | string or null | Direct recipient |
+| `channel` | string | Defaults to `general` or `direct` |
+| `kind` | string | See message kinds below |
+| `body` | string | Optional if attachments present |
+| `attachments` | array | Attachment list |
+| `reply_to` | integer or null | References another message id |
+| `thread_id` | string or null | Thread grouping key |
+| `metadata` | object | Arbitrary JSON object |
+
+### 4.4 Claim
+
+| Field | Type | Notes |
+|---|---|---|
+| `claim_key` | string | Primary identifier |
+| `thread_id` | string or null | Optional thread binding |
+| `task_message_id` | integer or null | Optional linked task |
+| `owner_agent_id` | string | Current holder |
+| `claimed_at` | string | UTC timestamp |
+| `expires_at` | string | UTC timestamp |
+| `released_at` | string or null | Release marker |
+| `metadata` | object | Arbitrary JSON object |
+
+### 4.5 Lock
+
+| Field | Type | Notes |
+|---|---|---|
+| `file_path` | string | Primary identifier |
+| `agent_id` | string | Current holder |
+| `locked_at` | string | UTC timestamp |
+| `expires_at` | string | UTC timestamp |
+| `released_at` | string or null | Release marker |
+| `metadata` | object | Arbitrary JSON object |
+
+### 4.6 Task
+
+| Field | Type | Notes |
+|---|---|---|
+| `task_id` | integer | Equal to a message id |
+| `parent_task_id` | integer or null | Parent task |
+| `channel` | string | Owning channel |
+| `thread_id` | string or null | Optional thread binding |
+| `status` | string | `open` or `done` |
+| `created_at` | string | UTC timestamp |
+| `completed_at` | string or null | Completion timestamp |
+
+### 4.7 Thread Summary
+
+| Field | Type | Notes |
+|---|---|---|
+| `thread_id` | string | Thread identifier |
+| `channel` | string or null | Derived channel |
+| `root_task_id` | integer or null | Lowest root task id |
+| `latest_message_id` | integer or null | Latest message in thread |
+| `latest_message_ts` | string or null | Latest message timestamp |
+| `latest_artifact_id` | integer or null | Highest artifact id |
+| `message_count` | integer | Count of thread messages |
+| `total_task_count` | integer | Total tasks in thread |
+| `open_task_count` | integer | Open tasks in thread |
+| `active_claim_count` | integer | Active claims in thread |
+| `active_lock_count` | integer | Active locks with matching `metadata.thread_id` |
+| `status` | string | `completed`, `open`, or `waiting` |
+
+## 5. Message Kinds and Attachments
+
+### 5.1 Message Kinds
+
+The reference implementation accepts these message kinds:
+
+| Kind | Meaning | Hub-side behavior |
+|---|---|---|
+| `chat` | General conversation | Stored as-is |
+| `notice` | Progress or operational notice | Stored as-is |
+| `task` | Work request | Stored and auto-registered as a task |
+| `claim` | Informational claim notice | Stored as-is |
+| `release` | Informational release notice | Stored as-is |
+| `artifact` | Completed output | Stored as-is |
+| `task_request` | RPC-like work request | Stored and auto-registered as a task |
+| `task_result` | RPC-like result | May auto-complete the linked `task_request` |
+
+This is the complete set of message kinds for Arc v1. A conforming hub MUST
+reject posts whose `kind` is not in this set with HTTP `400`. Growth of this
+set is a protocol-version change, not a forward-compatible extension; see
+§10.2.
+
+Emitters MUST send `kind` in lowercase. Hubs MAY accept mixed case as an
+input-side convenience but MUST normalize to lowercase before storage.
+
+### 5.2 Attachments
+
+Supported attachment types:
+
+| Type | Required fields | Optional fields |
+|---|---|---|
+| `text` | `content` | none |
+| `json` | `content` | none |
+| `code` | `content` | `language` |
+| `file_ref` | `path` | `description`, `start_line`, `end_line` |
+| `diff_ref` | `path` | `description`, `base`, `head`, `start_line`, `end_line` |
+
+Inline attachment size is measured against the JSON-encoded `content` value.
+
+## 6. Endpoint Catalog
+
+### 6.1 Sessions
+
+#### `POST /v1/sessions`
+
+Request body:
+
 ```json
 {
-  "agent_id": "my-agent",
-  "display_name": "My Agent",
-  "capabilities": ["code", "review"],
+  "agent_id": "worker-a",
+  "display_name": "Worker A",
+  "capabilities": ["review"],
   "metadata": {},
   "replace": false
 }
 ```
 
-| Field          | Required | Default        | Notes                                |
-|----------------|----------|----------------|--------------------------------------|
-| `agent_id`     | yes      | —              | Non-empty string                     |
-| `display_name` | no       | `agent_id`     |                                      |
-| `capabilities` | no       | `[]`           | Array of strings                     |
-| `metadata`     | no       | `{}`           | JSON object                          |
-| `replace`      | no       | `false`        | If true, deactivate existing session |
+Rules:
 
-**Success response** (`201`):
+- `agent_id` is required
+- `display_name` defaults to `agent_id`
+- `capabilities` defaults to `[]`
+- `metadata` defaults to `{}`
+- `replace` defaults to `false`
+- if an active, non-expired session already exists for the same `agent_id` and
+  `replace` is false, the hub MUST return `409`
+- if the existing session is expired, the hub MAY replace it without requiring
+  `replace=true`
+
+Success:
+
+- `201` with the session object
+
+Errors:
+
+- `400` for validation
+- `409` for active-session collision
+
+#### `POST /v1/sessions/{agent_id}/rename`
+
+Request body:
+
 ```json
-{
-  "ok": true,
-  "result": {
-    "session_id": "uuid-v4",
-    "agent_id": "my-agent",
-    "display_name": "My Agent",
-    "capabilities": ["code", "review"],
-    "metadata": {},
-    "created_at": "2025-01-01T00:00:00Z",
-    "last_seen": "2025-01-01T00:00:00Z",
-    "active": true
-  }
-}
+{ "display_name": "New Name" }
 ```
 
-**Error**: `409` if agent already has an active, non-expired session and `replace` is false. `400` for validation errors.
+Rules:
 
-**Behavior**: Only one active session per `agent_id`. If `replace: true`, the existing session is deactivated first. If the existing session's `last_seen` is older than `presence_ttl_sec`, it is treated as expired and replaced regardless of the `replace` flag.
+- `display_name` is required
+- the reference implementation rejects empty values and values longer than 64
+  characters
 
-### 5.1a. `POST /v1/sessions/{agent_id}/rename` — Rename Session
+Success:
 
-**Request body**: `{ "display_name": "..." }` (required, 1–64 chars)
+- `200` with the updated session row
 
-**Success response** (`200`): `{ "ok": true, "result": <session> }` — returns the updated session row. Only `display_name` changes; `agent_id` and `session_id` are stable.
+Errors:
 
-**Error**: `404` if no active session for `agent_id`. `400` for empty or oversized `display_name`.
+- `400` for validation
+- `404` if there is no active session for `agent_id`
 
-### 5.2. `DELETE /v1/sessions/{session_id}` — Close Session
+#### `DELETE /v1/sessions/{session_id}`
 
-**Success response** (`200`):
-```json
-{
-  "ok": true,
-  "result": { "session_id": "uuid-v4", "deleted": true }
-}
-```
+Success:
 
-**Error**: `404` if session not found or already inactive.
+- `200` with `{ "session_id": "...", "deleted": true }`
 
-### 5.3. `GET /v1/agents` — List Active Agents
+Errors:
 
-Returns all sessions with `active = 1` and `last_seen` within `presence_ttl_sec`. Triggers pruning of expired sessions.
+- `404` if the session does not exist or is already inactive
 
-**Response** (`200`):
-```json
-{
-  "ok": true,
-  "result": [
-    {
-      "session_id": "...", "agent_id": "...", "display_name": "...",
-      "capabilities": [...], "metadata": {}, "created_at": "...",
-      "last_seen": "...", "active": true
-    }
-  ]
-}
-```
+#### `GET /v1/agents`
 
-### 5.4. `GET /v1/channels` — List Channels
+Query parameters:
 
-**Response** (`200`):
-```json
-{
-  "ok": true,
-  "result": [
-    { "name": "general", "created_at": "...", "created_by": "system", "metadata": {} },
-    { "name": "direct", "created_at": "...", "created_by": "system", "metadata": {} }
-  ]
-}
-```
+| Name | Meaning |
+|---|---|
+| `capability` | Optional membership filter |
+| `as` | Optional compatibility parameter that touches the named session before listing |
 
-### 5.5. `POST /v1/channels` — Create Channel
+Behavior:
 
-**Request body**:
+- the hub prunes expired sessions before returning
+- if `capability` is present, only sessions whose `capabilities` contain that
+  value are returned
+
+### 6.2 Channels
+
+#### `GET /v1/channels`
+
+Returns all known channels.
+
+#### `POST /v1/channels`
+
+Request body:
+
 ```json
 { "name": "builds", "created_by": "agent-a", "metadata": {} }
 ```
 
-**Responses**: `201` if newly created, `200` if already exists (returns existing channel). `400` for validation errors.
+Success:
 
-### 5.5a. `GET /v1/hub-info` — Hub Storage Metadata
+- `201` if the channel was created
+- `200` if the channel already existed
 
-**Response** (`200`):
+### 6.3 Hub Information
+
+#### `GET /v1/hub-info`
+
+Returns hub metadata. The response is the primary capability-negotiation
+surface for clients; it is where optional bindings and optional behaviors
+are advertised.
+
 ```json
 {
   "ok": true,
   "result": {
+    "instance_id": "mh1-...",
+    "protocol_version": "1",
+    "default_channel": "general",
+    "max_body_chars": 128000,
+    "max_attachment_chars": 256000,
+    "max_attachments": 32,
+    "features": [
+      "sse",
+      "relay",
+      "long_poll_keepalive",
+      "subtask_rollup",
+      "rpc_kinds",
+      "capability_filter",
+      "shutdown_control",
+      "session_rename"
+    ],
+    "message_kinds": [
+      "artifact", "chat", "claim", "notice",
+      "release", "task", "task_request", "task_result"
+    ],
     "storage_path": "/abs/path/to/arc.sqlite3",
-    "instance_id": "mh1-0123456789abcdef0123",
     "journal_mode": "wal",
-    "wal_mode": true
+    "wal_mode": true,
+    "allow_remote": false
   }
 }
 ```
 
-**Notes**:
-- `storage_path` is the resolved SQLite file path used by this hub process
-- `instance_id` is the same opaque identifier surfaced via `X-Arc-Instance`
-- `journal_mode` reports SQLite's actual journal mode for this process
-- `wal_mode` is a convenience boolean equivalent to `journal_mode == "wal"`
+Normative requirements:
 
-### 5.6. `POST /v1/messages` — Post Message
+- `instance_id` MUST be present and MUST match the value emitted in the
+  `X-Arc-Instance` response header (§3.3).
+- `protocol_version` MUST be present. The value for this specification is
+  the string `"1"`.
+- `features` MUST be present. It MUST be a JSON array of strings. An empty
+  array is legal (e.g. a minimal hub implementing only the CORE profile).
+- `message_kinds` MUST be present. It MUST list every value the hub accepts
+  on `POST /v1/messages`. A conforming v1 hub MUST list exactly the eight
+  kinds in §5.1.
+- `max_body_chars`, `max_attachment_chars`, `max_attachments`, and
+  `default_channel` MUST be present.
+- `storage_path`, `journal_mode`, `wal_mode`, and `allow_remote` are
+  reference-implementation details. Clients MUST treat them as informational
+  and MUST NOT depend on them for interoperability.
 
-**Request body**:
+#### `features` vocabulary
+
+The following tokens have normative meaning in Arc v1. A hub MUST include a
+token if and only if it implements the behavior that token names.
+
+| Token | Meaning |
+|---|---|
+| `sse` | The optional streaming binding `GET /v1/stream` (§6.9) is implemented. |
+| `relay` | The file-relay binding in Appendix B is implemented. |
+| `long_poll_keepalive` | The hub refreshes session presence during active `/v1/events` long-poll waits, as required by §3.8. |
+| `subtask_rollup` | Completing all direct children of a parent task auto-completes the parent, as described in §6.8. |
+| `rpc_kinds` | Posting `task_result` with `reply_to` referencing an open `task_request` auto-completes the linked task and annotates the stored message with `metadata.task_completed`, as described in §7.2. |
+| `capability_filter` | `GET /v1/agents?capability=<name>` honors the capability filter. |
+| `shutdown_control` | The optional admin surface (`GET /v1/shutdown`, `POST /v1/shutdown`, `POST /v1/shutdown/cancel`, `POST /v1/network`) is implemented. |
+| `session_rename` | `POST /v1/sessions/{agent_id}/rename` is implemented. A conforming v1 hub MUST advertise this token because the endpoint is part of the CORE profile (§1.1); clients MAY use its presence to distinguish conforming v1 hubs from partial implementations. |
+
+Hubs MAY include additional vendor-specific tokens in `features`. To avoid
+collisions with future spec tokens, vendor tokens SHOULD be prefixed with a
+short vendor label followed by a colon, for example `"acme:audit_log"`.
+
+Clients MUST tolerate unknown `features` tokens without error. Clients SHOULD
+check `features` membership before calling an optional binding or relying on
+an optional behavior, and SHOULD fall back gracefully when a token is absent.
+
+### 6.4 Messages and Visibility
+
+#### Direct-message visibility rules
+
+These rules are critical for interoperable clients:
+
+- `GET /v1/messages` returns channel-visible messages only; direct messages are
+  excluded
+- `GET /v1/events` returns the visible stream for one agent: broadcast messages
+  plus direct messages addressed to that agent
+- `GET /v1/inbox/{agent_id}` returns direct messages only
+- `GET /v1/threads/{thread_id}` includes both direct and channel messages in the
+  thread detail payload
+
+#### `POST /v1/messages`
+
+Request body:
+
 ```json
 {
-  "from_agent": "agent-a",
+  "from_agent": "worker-a",
   "to_agent": null,
   "channel": "general",
   "kind": "chat",
-  "body": "Hello world",
+  "body": "hello",
   "attachments": [],
   "reply_to": null,
   "thread_id": null,
-  "metadata": {}
+  "metadata": {},
+  "parent_task_id": null
 }
 ```
 
-| Field        | Required | Default      | Notes                                          |
-|--------------|----------|--------------|-------------------------------------------------|
-| `from_agent` | yes      | —            | Non-empty string                                |
-| `to_agent`   | no       | `null`       | If set, message is direct (inbox delivery)      |
-| `channel`    | no       | `"general"`  | `"direct"` if `to_agent` is set                 |
-| `kind`       | no       | `"chat"`     | One of: `chat`, `notice`, `task`, `claim`, `release`, `artifact` |
-| `body`       | no*      | `""`         | *At least one of `body` or `attachments` required |
-| `attachments`| no       | `[]`         | Array of attachment objects (max 16)             |
-| `reply_to`   | no       | `null`       | Integer reference to another message `id`        |
-| `thread_id`  | no       | `null`       | String grouping key                              |
-| `metadata`   | no       | `{}`         | JSON object                                      |
-| `parent_task_id` | no   | `null`       | For `kind: "task"` messages, links the new task to an existing parent task. Validated: must reference an existing `task_id` or the request fails with `400`. |
+Rules:
 
-**Success response** (`201`):
-```json
-{
-  "ok": true,
-  "result": {
-    "id": 1, "ts": "...", "from_agent": "agent-a", "to_agent": null,
-    "channel": "general", "kind": "chat", "body": "Hello world",
-    "attachments": [], "reply_to": null, "thread_id": null, "metadata": {}
-  }
-}
-```
+- `from_agent` is required
+- at least one of `body` or `attachments` is required
+- `channel` defaults to `general`, or `direct` if `to_agent` is present
+- if `to_agent` is null, the channel MUST exist
+- if `to_agent` is non-null, the channel acts as a label and is not required to
+  exist in the channel table
+- `kind` MUST be one of the supported message kinds
+- `attachments` MUST be a list
+- attachment count MUST NOT exceed the hub limit
+- `reply_to`, if present, must be an integer
+- `metadata`, if present, must be an object
+- `parent_task_id`, if present, must reference an existing task
 
-**Side effect**: Touching the sender's session (`last_seen` refreshed).
+Hub-side side effects:
 
-**Validation**:
-- If `to_agent` is null, the channel must exist
-- `kind` must be one of the six valid kinds
-- `body` max 128,000 characters (default, configurable via `--max-body-chars`)
-- Max 32 attachments (default, configurable via `--max-attachments`), each inline attachment max 256,000 characters JSON-encoded (default, configurable via `--max-attachment-chars`)
-- If `parent_task_id` is provided, it must reference an existing row in `tasks`. Missing rows return `400 parent_task_id references unknown task`.
+- posting touches the sender's active session
+- `kind=task` and `kind=task_request` auto-register a task row
+- `kind=task_result` with `reply_to` referencing an open `task_request` causes
+  the linked task to be auto-completed and adds `metadata.task_completed`
 
-### 5.7. `GET /v1/messages` — Query Messages
+Success:
 
-**Query parameters**:
+- `201` with the created message
 
-| Parameter   | Required      | Default | Notes                               |
-|-------------|---------------|---------|--------------------------------------|
-| `channel`   | yes*          | —       | *At least one of `channel` or `thread_id` |
-| `thread_id` | yes*          | —       |                                      |
-| `since_id`  | no            | `0`     | Return messages with `id > since_id` |
-| `limit`     | no            | `100`   | Capped at `max_query_limit` (500)    |
+Errors:
 
-**Behavior**:
-- **Channel query**: Returns messages where `channel = ?` and `to_agent IS NULL` and `id > since_id`, ordered by `id ASC`.
-- **Thread query**: Returns messages where `thread_id = ?` and `to_agent IS NULL` and `id > since_id`, ordered by `id ASC`. If `channel` is also provided, it must match too.
-- At least one of `channel` or `thread_id` must be provided.
+- `400` for validation
+- `404` is not used here for missing channels in the reference implementation;
+  missing channel is reported as `400`
 
-**Response** (`200`):
-```json
-{ "ok": true, "result": [ { "id": 1, ... }, { "id": 2, ... } ] }
-```
+#### `GET /v1/messages`
 
-**Error**: `400` if neither parameter provided. `404` if channel not found.
+Query parameters:
 
-### 5.8. `GET /v1/threads` — List Thread Summaries
+| Name | Meaning |
+|---|---|
+| `channel` | Required unless `thread_id` is present |
+| `thread_id` | Required unless `channel` is present |
+| `since_id` | Return rows with `id > since_id` |
+| `limit` | Maximum rows |
+| `timeout` | Optional long-poll wait in seconds |
 
-Returns one summary per known `thread_id`. A thread is discovered from messages, tasks, and claims.
+Behavior:
 
-**Response** (`200`):
-```json
-{
-  "ok": true,
-  "result": [
-    {
-      "thread_id": "task-auth-001",
-      "channel": "general",
-      "root_task_id": 12,
-      "latest_message_id": 18,
-      "latest_message_ts": "2025-01-01T00:00:00Z",
-      "latest_artifact_id": 17,
-      "message_count": 5,
-      "total_task_count": 2,
-      "open_task_count": 1,
-      "active_claim_count": 1,
-      "active_lock_count": 1,
-      "status": "open"
-    }
-  ]
-}
-```
+- channel query returns `to_agent IS NULL` rows in that channel
+- thread query returns `to_agent IS NULL` rows in that thread
+- if both `thread_id` and `channel` are present, both filters apply
+- direct messages are not returned by this endpoint
+- if `timeout > 0`, the hub MAY long-poll until matching rows arrive or the
+  timeout expires
 
-**Status derivation**:
-- `completed` when the thread has tasks and all of them are done
-- `open` when at least one active claim or thread-scoped lock exists
+Errors:
+
+- `400` if neither `channel` nor `thread_id` is provided
+- `404` if `channel` is provided and the channel does not exist
+
+#### `GET /v1/events`
+
+Query parameters:
+
+| Name | Meaning |
+|---|---|
+| `agent_id` | Required |
+| `channel` | Optional channel filter |
+| `thread_id` | Optional thread filter |
+| `since_id` | Return rows with `id > since_id` |
+| `limit` | Maximum rows |
+| `timeout` | Optional long-poll wait in seconds |
+| `exclude_self` | Hide rows whose `from_agent == agent_id` |
+
+Behavior:
+
+- returns rows visible to the named agent
+- visible means `to_agent IS NULL OR to_agent = agent_id`
+- applies optional `channel` and `thread_id` filters
+- ordered by ascending `id`
+- if `timeout > 0`, the hub MAY long-poll
+- a conforming hub MUST refresh presence during active long-poll waits
+
+Errors:
+
+- `400` if `agent_id` is omitted
+- `404` if `channel` is provided and does not exist
+
+#### `GET /v1/bootstrap`
+
+Query parameters:
+
+| Name | Meaning |
+|---|---|
+| `agent_id` | Required |
+
+Response fields:
+
+- `agent_id`
+- `session` or `null`
+- `latest_visible_id`
+- `live_agents`
+- `default_channel`
+
+Clients SHOULD use `latest_visible_id` as the next `since_id` when they want to
+start from "now" instead of replaying old traffic.
+
+#### `GET /v1/inbox/{agent_id}`
+
+Query parameters:
+
+| Name | Meaning |
+|---|---|
+| `since_id` | Return rows with `id > since_id` |
+| `limit` | Maximum rows |
+
+Returns direct messages only.
+
+### 6.5 Threads
+
+#### `GET /v1/threads`
+
+Returns one thread summary per discovered `thread_id`.
+
+Thread discovery in the reference implementation comes from messages, tasks, and
+claims. Locks enrich an existing thread summary when `metadata.thread_id`
+matches, but a lock by itself does not create a discoverable thread.
+
+Status derivation:
+
+- `completed` if the thread has tasks and all are done
+- `open` if there is at least one active claim or matching active lock
 - `waiting` otherwise
 
-**Notes**:
-- `root_task_id` is the smallest task id in the thread whose `parent_task_id` is null
-- `latest_artifact_id` is the highest message id in the thread with `kind = "artifact"`
-- `active_lock_count` counts locks whose `metadata.thread_id` matches the thread and whose lease is active
+#### `GET /v1/threads/{thread_id}`
 
-### 5.9. `GET /v1/threads/{thread_id}` — Get Thread Detail
+Returns:
 
-Returns one thread summary plus the full set of related records for drill-down views.
+- `thread`: one summary
+- `messages`: all messages in the thread, including direct messages
+- `tasks`: matching task rows
+- `claims`: matching claim rows
+- `locks`: matching lock rows whose `metadata.thread_id` equals the thread id
 
-**Response** (`200`):
+Errors:
+
+- `404` if the thread is unknown
+
+### 6.6 Claims
+
+#### `POST /v1/claims`
+
+Request body:
+
 ```json
 {
-  "ok": true,
-  "result": {
-    "thread": {
-      "thread_id": "task-auth-001",
-      "channel": "general",
-      "root_task_id": 12,
-      "latest_message_id": 18,
-      "latest_message_ts": "2025-01-01T00:00:00Z",
-      "latest_artifact_id": 17,
-      "message_count": 5,
-      "total_task_count": 2,
-      "open_task_count": 1,
-      "active_claim_count": 1,
-      "active_lock_count": 1,
-      "status": "open"
-    },
-    "messages": [
-      { "id": 12, "thread_id": "task-auth-001", "...": "..." }
-    ],
-    "tasks": [
-      { "task_id": 12, "parent_task_id": null, "...": "..." }
-    ],
-    "claims": [
-      { "claim_key": "task-12", "thread_id": "task-auth-001", "...": "..." }
-    ],
-    "locks": [
-      { "file_path": "src/auth.py", "metadata": { "thread_id": "task-auth-001" }, "...": "..." }
-    ]
-  }
-}
-```
-
-**Error**: `404` if the thread is unknown.
-
-**Behavior**:
-- Includes direct and channel messages that share the same `thread_id`
-- Includes claims with matching `thread_id`
-- Includes locks whose `metadata.thread_id` matches the thread
-
-### 5.10. `GET /v1/events` — Unified Agent Event Feed
-
-Returns the full message stream visible to one agent: broadcast messages plus direct messages addressed to that agent.
-
-**Query parameters**:
-
-| Parameter      | Required | Default | Notes |
-|----------------|----------|---------|-------|
-| `agent_id`     | yes      | —       | Agent visibility context |
-| `channel`      | no       | —       | Optional channel filter |
-| `thread_id`    | no       | —       | Optional thread filter |
-| `since_id`     | no       | `0`     | Return messages with `id > since_id` |
-| `limit`        | no       | `100`   | Capped at `max_query_limit` (500) |
-| `timeout`      | no       | `0`     | Long-poll seconds (max 60); waits until new messages land or the window expires |
-| `exclude_self` | no       | `false` | When truthy (`1`, `true`, `yes`), suppresses messages whose `from_agent == agent_id`. **Recommended default for polling agents** so they never reply to their own posts in a loop. |
-
-**Behavior**:
-- Returns messages where `id > since_id` and `(to_agent IS NULL OR to_agent = agent_id)`
-- If `channel` is provided, only messages in that channel are returned
-- If `thread_id` is provided, only messages in that thread are returned
-- If `exclude_self` is set, rows with `from_agent = agent_id` are additionally filtered out
-- Results are ordered by `id ASC`
-
-**Response** (`200`):
-```json
-{ "ok": true, "result": [ { "id": 1, ... }, { "id": 2, ... } ] }
-```
-
-**Error**: `400` if `agent_id` is omitted. `404` if `channel` is provided and does not exist.
-
-### 5.10a. `GET /v1/bootstrap` — One-Shot Rehydrate
-
-Returns everything an agent needs to resume after a restart or to orient on first connect: the active session (if any), the highest message id currently visible to the agent, the current live-agent roster, and the default channel name. This lets clients skip the "guess a `since_id`" step.
-
-**Query parameters**:
-
-| Parameter  | Required | Default | Notes |
-|------------|----------|---------|-------|
-| `agent_id` | yes      | —       | Agent visibility context |
-
-**Response** (`200`):
-```json
-{
-  "ok": true,
-  "result": {
-    "agent_id": "opus",
-    "session": { "session_id": "...", "agent_id": "opus", "active": true, ... },
-    "latest_visible_id": 42,
-    "live_agents": [ { "agent_id": "opus", ... }, { "agent_id": "gpt", ... } ],
-    "default_channel": "general"
-  }
-}
-```
-
-`session` is `null` if the agent has no active session. Clients should adopt `latest_visible_id` as their starting `since_id` for subsequent `/v1/events` polls so they only see messages posted after rehydration.
-
-**Error**: `400` if `agent_id` is omitted.
-
-### 5.11. `GET /v1/inbox/{agent_id}` — Agent Inbox
-
-Returns direct messages (`to_agent = ?`) for the specified agent.
-
-**Query parameters**: `since_id` (default `0`), `limit` (default `100`).
-
-**Response** (`200`): Same shape as messages query.
-
-### 5.12. `POST /v1/claims` — Acquire or Refresh Claim
-
-**Request body**:
-```json
-{
-  "owner_agent_id": "agent-b",
+  "owner_agent_id": "worker-a",
   "claim_key": "task-42",
   "task_message_id": 42,
-  "thread_id": "task-frob-001",
+  "thread_id": "thread-42",
   "ttl_sec": 300,
   "metadata": {}
 }
 ```
 
-| Field             | Required | Default          | Notes                                     |
-|-------------------|----------|------------------|--------------------------------------------|
-| `owner_agent_id`  | yes      | —                | Non-empty string                           |
-| `claim_key`       | no       | `task-{task_message_id}` | Derived if only `task_message_id` given |
-| `task_message_id` | no       | —                | Integer                                    |
-| `thread_id`       | no       | —                | String                                     |
-| `ttl_sec`         | no       | `300`            | Minimum 5                                  |
-| `metadata`        | no       | `{}`             | JSON object                                |
+Rules:
 
-At least one of `claim_key` or `task_message_id` must be provided.
+- `owner_agent_id` is required
+- at least one of `claim_key` or `task_message_id` is required
+- if `claim_key` is absent and `task_message_id` is present, the reference
+  implementation derives `claim_key = "task-{task_message_id}"`
+- same-owner re-acquire refreshes the lease
+- different-owner acquire returns the existing active claim with
+  `"acquired": false`
+- expired or released claims may be overwritten by a new acquire
 
-**Responses**:
+Success:
 
-Acquired (`201`):
+- `201` with `"acquired": true` when the claim is granted
+- `200` with `"acquired": false` when the claim is denied because another owner
+  still holds it
+
+#### `POST /v1/claims/refresh`
+
+Request body:
+
 ```json
-{ "ok": true, "acquired": true, "result": { "claim_key": "task-42", ... } }
+{ "claim_key": "task-42", "owner_agent_id": "worker-a", "ttl_sec": 300 }
 ```
 
-Denied — held by another agent (`200`):
+Behavior:
+
+- refreshes an active claim without changing ownership
+
+Errors:
+
+- `404` if the claim does not exist, is inactive, or is owned by someone else
+
+#### `POST /v1/claims/release`
+
+Request body:
+
 ```json
-{ "ok": true, "acquired": false, "result": { "claim_key": "task-42", "owner_agent_id": "agent-a", ... } }
+{ "claim_key": "task-42", "agent_id": "worker-a" }
 ```
 
-**Side effect**: Touches the owner's session.
+Behavior:
 
-### 5.13. `POST /v1/claims/refresh` — Refresh Claim Lease
+- releases the claim if and only if `agent_id` matches the current owner
 
-Extends the TTL on an existing active claim without changing ownership.
+Errors:
 
-**Request body**:
-```json
-{ "claim_key": "task-42", "owner_agent_id": "agent-b", "ttl_sec": 300 }
-```
+- `404` if the claim does not exist, is inactive, or is not owned by `agent_id`
 
-All fields are required except `ttl_sec`, which defaults to `300` and must be at least `5`.
+#### `GET /v1/claims`
 
-**Success** (`200`):
-```json
-{ "ok": true, "acquired": true, "result": { "claim_key": "task-42", ... } }
-```
+Query parameters:
 
-**Error**: `404` if the claim does not exist, is no longer active, or is owned by another agent.
+| Name | Meaning |
+|---|---|
+| `thread_id` | Optional thread filter |
+| `active_only` | Optional active-only filter |
 
-**Side effect**: Touches the owner's session.
+Active means `released_at IS NULL` and `expires_at >= now`.
 
-### 5.14. `POST /v1/claims/release` — Release Claim
+### 6.7 Locks
 
-**Request body**:
-```json
-{ "claim_key": "task-42", "agent_id": "agent-b" }
-```
+Lock semantics mirror claim semantics, except the key is `file_path`.
 
-Both fields required. The `agent_id` must match the claim's `owner_agent_id`.
+#### `POST /v1/locks`
 
-**Success** (`200`):
-```json
-{ "ok": true, "result": { "claim_key": "task-42", "released_at": "...", ... } }
-```
+Request body:
 
-**Error**: `404` if claim not found or not owned by `agent_id`.
-
-**Side effect**: Touches the releaser's session.
-
-### 5.15. `GET /v1/claims` — List Claims
-
-**Query parameters**:
-
-| Parameter     | Default | Notes                               |
-|---------------|---------|--------------------------------------|
-| `thread_id`   | —       | Filter by thread                     |
-| `active_only` | `false` | `true`/`1`/`yes` to exclude released and expired |
-
-**Response** (`200`):
-```json
-{ "ok": true, "result": [ { "claim_key": "...", ... } ] }
-```
-
-Active = `released_at IS NULL AND expires_at >= now`.
-
-### 5.16. `POST /v1/locks` — Acquire or Refresh File Lock
-
-**Request body**:
 ```json
 {
-  "agent_id": "agent-b",
+  "agent_id": "worker-a",
   "file_path": "src/main.py",
   "ttl_sec": 300,
   "metadata": {}
 }
 ```
 
-| Field       | Required | Default | Notes                   |
-|-------------|----------|---------|--------------------------|
-| `agent_id`  | yes      | —       | Non-empty string         |
-| `file_path` | yes      | —       | Non-empty string         |
-| `ttl_sec`   | no       | `300`   | Minimum 5                |
-| `metadata`  | no       | `{}`    | JSON object              |
+Results:
 
-**Responses**:
+- `201` with `"acquired": true` when the lock is granted
+- `200` with `"acquired": false` when another active holder owns it
 
-Acquired (`201`):
-```json
-{ "ok": true, "acquired": true, "result": { "file_path": "src/main.py", "agent_id": "agent-b", ... } }
-```
+#### `POST /v1/locks/refresh`
 
-Denied — held by another agent (`200`):
-```json
-{ "ok": true, "acquired": false, "result": { "file_path": "src/main.py", "agent_id": "agent-a", ... } }
-```
+Refreshes an active lock owned by the same agent.
 
-**Behavior**: Same semantics as claims — same-owner re-acquire refreshes `expires_at`, expired/released locks can be overwritten.
+Errors:
 
-### 5.17. `POST /v1/locks/refresh` — Refresh File Lock Lease
+- `404` if the lock does not exist, is inactive, or is owned by another agent
 
-Extends the TTL on an existing active file lock without changing ownership.
+#### `POST /v1/locks/release`
 
-**Request body**:
-```json
-{ "file_path": "src/main.py", "agent_id": "agent-b", "ttl_sec": 300 }
-```
+Releases a lock owned by the named agent.
 
-All fields are required except `ttl_sec`, which defaults to `300` and must be at least `5`.
+Errors:
 
-**Success** (`200`):
-```json
-{ "ok": true, "acquired": true, "result": { "file_path": "src/main.py", ... } }
-```
+- `404` if the lock does not exist, is inactive, or is owned by another agent
 
-**Error**: `404` if the lock does not exist, is no longer active, or is held by another agent.
+#### `GET /v1/locks`
 
-**Side effect**: Touches the holder's session.
+Query parameters:
 
-### 5.18. `POST /v1/locks/release` — Release File Lock
+| Name | Meaning |
+|---|---|
+| `agent_id` | Optional holder filter |
+| `active_only` | Optional active-only filter |
 
-**Request body**:
-```json
-{ "file_path": "src/main.py", "agent_id": "agent-b" }
-```
+### 6.8 Tasks
 
-Both fields required. `agent_id` must match the lock holder.
+#### `GET /v1/tasks`
 
-**Success** (`200`):
-```json
-{ "ok": true, "result": { "file_path": "src/main.py", "released_at": "...", ... } }
-```
+Query parameters:
 
-**Error**: `404` if lock not found or not held by `agent_id`.
+| Name | Meaning |
+|---|---|
+| `parent_id` | Optional parent task filter |
+| `status` | Optional `open` or `done` filter |
+| `channel` | Optional channel filter |
+| `thread_id` | Optional thread filter |
 
-### 5.19. `GET /v1/locks` — List File Locks
+#### `POST /v1/tasks/{task_id}/complete`
 
-**Query parameters**:
+Behavior:
 
-| Parameter     | Default | Notes                               |
-|---------------|---------|--------------------------------------|
-| `agent_id`    | —       | Filter by holder                     |
-| `active_only` | `false` | Exclude released and expired locks   |
+- marks the task done
+- if all sibling subtasks of the same parent are done, the direct parent is
+  auto-completed
+- when the direct parent auto-completes, the hub posts a system `notice`
+  describing the rollup
 
-### 5.20. `GET /v1/tasks` — List Tasks
+The reference implementation performs one level of rollup per completion event.
 
-**Query parameters**:
+Errors:
 
-| Parameter   | Default | Notes                             |
-|-------------|---------|-----------------------------------|
-| `parent_id` | —       | Filter by parent task             |
-| `status`    | —       | `"open"` or `"done"`              |
-| `channel`   | —       | Filter by channel                 |
-| `thread_id` | —       | Filter by thread                  |
+- `404` if the task does not exist
 
-**Response** (`200`):
-```json
-{ "ok": true, "result": [ { "task_id": 1, "parent_task_id": null, "status": "open", ... } ] }
-```
+### 6.9 Optional Streaming Binding
 
-### 5.21. `POST /v1/tasks/{task_id}/complete` — Complete a Task
+#### `GET /v1/stream`
 
-Marks a task as `"done"` and sets `completed_at`. If all sibling subtasks of the same parent are now done, the parent is auto-completed and a `kind: "notice"` message is posted announcing the rollup.
+This endpoint is an optional server-sent events binding for the same visibility
+model exposed by `GET /v1/events`.
 
-**Success** (`200`):
-```json
-{ "ok": true, "result": { "task_id": 5, "status": "done", ... } }
-```
+Query parameters:
 
-If parent auto-completed:
-```json
-{ "ok": true, "result": { ... }, "parent_completed": true }
-```
+| Name | Meaning |
+|---|---|
+| `agent_id` | Required |
+| `channels` | Optional comma-separated channel filter |
+| `since_id` | Resume cursor |
+| `exclude_self` | Optional self-filter |
 
-**Error**: `404` if task not found.
+Event format:
 
-### 5.22. `GET /` — Live Dashboard
-
-Serves an auto-refreshing HTML page showing agents, claims, locks, channels, and messages. Zero dependencies — embedded HTML/CSS/JS that fetches from the API endpoints. Refreshes every 5 seconds.
-
-### 5.23. `POST /v1/messages` — Task Auto-Registration
-
-When a message with `kind: "task"` is posted, it is automatically registered in the `tasks` table. An optional `parent_task_id` field in the request body links it to a parent task for subtask trees.
-
----
-
-## 6. Error Shape
-
-All errors return:
-```json
-{ "ok": false, "error": "human-readable message" }
-```
-
-Common status codes: `400` (validation), `404` (not found), `409` (conflict).
-
----
-
-## 7. Session Lifecycle
+```text
+data: {"id": 123, ...}
 
 ```
-        ┌──────────┐
-        │  create   │  POST /v1/sessions
-        └────┬─────┘
-             │
-             ▼
-     ┌───────────────┐
-     │    active      │◄──── touch (on message post, claim acquire/release)
-     │  last_seen     │
-     └───┬───────┬───┘
-         │       │
-    close│       │ TTL expired (last_seen + ttl < now)
-         │       │
-         ▼       ▼
-     ┌───────────────┐
-     │   inactive     │
-     │  active = 0    │
-     └───────────────┘
-```
 
-- **Create**: Generates UUID v4 session. One active session per `agent_id`.
-- **Replace**: `replace: true` deactivates any existing session for the same agent.
-- **Touch**: `last_seen` is updated whenever the agent posts a message, acquires or refreshes a claim/lock, or releases a claim/lock.
-- **Expiry**: A background timer (every `ttl / 3` seconds) prunes sessions where `last_seen < now - presence_ttl_sec`.
-- **Recovery**: After pruning an expired session, the hub releases any active claims and locks still owned by that agent and posts `kind: "notice"` recovery messages so the stranded work becomes visible and reclaimable.
-- **Close**: `DELETE /v1/sessions/{id}` sets `active = 0`.
-- **Restart**: On server start, all sessions are deactivated (`active = 0`).
+Notes:
 
----
+- the reference implementation does not emit named event types
+- the reference implementation does not emit explicit heartbeat frames; it keeps
+  the stream alive by holding the connection open and periodically touching the
+  session
+- clients SHOULD reconnect using the highest seen message id as `since_id`
 
-## 8. Claims State Machine
+### 6.10 Optional Admin Surface
 
-```
-                              ┌────────────────┐
-                              │   unclaimed     │
-                              │ (no row exists) │
-                              └───────┬────────┘
-                                      │ POST /v1/claims
-                                      │ (first acquire)
-                                      ▼
-                              ┌────────────────┐
-            ┌────────────────►│    active       │◄────── refresh (same owner re-acquires)
-            │                 │ released_at=NULL│        → extends expires_at
-            │                 │ expires_at > now│
-            │                 └──┬──────────┬──┘
-            │                    │          │
-            │       release      │          │ expires_at < now
-            │  POST claims/release           │ (owner abandoned)
-            │                    │          │
-            │                    ▼          ▼
-            │            ┌──────────┐  ┌──────────┐
-            │            │ released  │  │ expired   │
-            │            │released_at│  │released_at│
-            │            │ != NULL   │  │ = NULL    │
-            │            └──────────┘  │expires_at  │
-            │                          │ < now      │
-            │                          └──────────┘
-            │                    │          │
-            └────────────────────┴──────────┘
-                    new acquire (any agent)
-                    → overwrites row, resets to active
-```
+#### `GET /v1/shutdown`
 
-**State transitions**:
+Returns shutdown status, or `null` status data when no shutdown is pending.
 
-| From | Event | To | Condition |
-|------|-------|----|-----------|
-| (none) | acquire | active | No existing claim row |
-| active | acquire (same owner) | active | Refreshes `expires_at` |
-| active | refresh (same owner) | active | Refreshes `expires_at` via `POST /v1/claims/refresh` |
-| active | acquire (different owner) | active (denied) | Returns existing claim, `acquired: false` |
-| active | release (owner) | released | Sets `released_at` |
-| active | session expiry | released | Recovery path releases stale work and posts a notice |
-| active | release (wrong agent) | (error 404) | Only owner can release |
-| active | time passes | expired | `expires_at < now` |
-| released | acquire (any) | active | Overwrites row |
-| expired | acquire (any) | active | Overwrites row |
+#### `POST /v1/shutdown`
 
----
-
-## 9. Polling Convention
-
-Agents consume messages by polling with `since_id`. This is the standard pattern:
-
-```
-Agent                                    Hub
-  │                                       │
-  │  GET /v1/messages?channel=general     │
-  │       &since_id=0                     │
-  │──────────────────────────────────────►│
-  │  ◄── [msg id=1, msg id=2, msg id=3]  │
-  │                                       │
-  │  (process messages, remember max id)  │
-  │                                       │
-  │  GET /v1/messages?channel=general     │
-  │       &since_id=3                     │
-  │──────────────────────────────────────►│
-  │  ◄── [msg id=4]                       │
-  │                                       │
-  │  (sleep poll_interval, repeat)        │
-```
-
-**Rules**:
-1. On first connect, call `GET /v1/bootstrap?agent_id=...` and adopt `latest_visible_id` as your starting `since_id`. This skips the "start from 0 and replay the world" phase.
-2. Track the highest `id` seen
-3. On each poll, pass `since_id={highest_seen_id}`
-4. The server returns messages with `id > since_id`
-5. Use `timeout=<seconds>` (max 60) on `/v1/events` for long-poll semantics — the hub blocks until new messages land or the window expires
-6. Pass `exclude_self=1` on `/v1/events` so you do not see your own posts echoed back. This is the **recommended default for agent polling** and prevents a naive agent from replying to its own messages in a loop.
-7. Poll interval is agent-configurable (1 second is typical) — and can be `timeout` itself when using long-poll
-
-This pattern works for channels (`channel=...`), threads (`thread_id=...`), and inbox (`/v1/inbox/{agent_id}`).
-
-The `arc.ArcClient` Python class (same module as the hub) implements this convention: it tracks `since_id` internally, defaults to `exclude_self=True`, and calls `bootstrap()` on first use if asked. Sandboxed agents that cannot reach `127.0.0.1` use the same class via `ArcClient.over_relay(agent_id, spool_dir=...)`, which swaps the HTTP transport for `FileRelayClient` while preserving every method signature and error-handling behavior.
-
----
-
-## 10. Message Kinds & Conventions
-
-| Kind       | Purpose                                    | Typical sender |
-|------------|---------------------------------------------|----------------|
-| `chat`     | Free-form conversation                      | Any agent      |
-| `notice`   | Operational status, progress, summary       | Any agent      |
-| `task`     | Defines a unit of work                      | Requester      |
-| `claim`    | Announces intent to work (informational)    | Worker         |
-| `artifact` | Delivers completed work product             | Worker         |
-| `release`  | Announces relinquishing ownership           | Worker         |
-
-The server stores all kinds identically. Semantic enforcement is the responsibility of participating agents. The `claim` and `release` message kinds are informational — actual locking is done via the claims API.
-
----
-
-## 11. Attachment Types
-
-### Inline (content stored in message)
-
-| Type   | Required fields | Optional      | Size limit                       |
-|--------|-----------------|---------------|----------------------------------|
-| `text` | `content`       | —             | 256,000 chars default (JSON-encoded, configurable) |
-| `json` | `content`       | —             | 256,000 chars default (JSON-encoded, configurable) |
-| `code` | `content`       | `language`    | 256,000 chars default (JSON-encoded, configurable) |
-
-### Reference (pointer to external resource)
-
-| Type       | Required | Optional                                      |
-|------------|----------|------------------------------------------------|
-| `file_ref` | `path`   | `description`, `start_line`, `end_line`        |
-| `diff_ref` | `path`   | `description`, `base`, `head`, `start_line`, `end_line` |
-
----
-
-## 12. Task Workflow
-
-The canonical five-step lifecycle:
-
-```
-1. TASK       Agent A posts kind:"task" with a thread_id
-2. CLAIM      Agent B acquires a claim via POST /v1/claims
-3. ARTIFACT   Agent B posts kind:"artifact" with attachments
-4. RELEASE    Agent B releases the claim via POST /v1/claims/release
-5. SUMMARY    Agent A posts kind:"notice" closing the thread
-```
-
-**Conventions**:
-1. Every task should include a `thread_id` to group all related messages and claims.
-2. Use `reply_to` to reference the original task message.
-3. Post the artifact before releasing the claim.
-4. Set `ttl_sec` proportional to expected task duration.
-5. Use `notice` kind for progress updates and summaries.
-
----
-
-## 13. File Locks
-
-File locks let agents declare intent to edit a specific file, preventing conflicts. They follow the same state machine as claims (acquire → active → release/expire) but keyed by file path instead of claim key.
-
-### State Machine
-
-| From | Event | To | Condition |
-|------|-------|----|-----------|
-| (none) | acquire | active | No existing lock row |
-| active | acquire (same agent) | active | Refreshes `expires_at` |
-| active | refresh (same agent) | active | Refreshes `expires_at` via `POST /v1/locks/refresh` |
-| active | acquire (different agent) | active (denied) | Returns existing lock, `acquired: false` |
-| active | release (holder) | released | Sets `released_at` |
-| active | session expiry | released | Recovery path releases stale work and posts a notice |
-| active | time passes | expired | `expires_at < now` |
-| released/expired | acquire (any) | active | Overwrites row |
-
-### Usage Pattern
-
-```
-Agent A: POST /v1/locks  { "agent_id": "a", "file_path": "src/main.py" }
-         → acquired: true
-Agent B: POST /v1/locks  { "agent_id": "b", "file_path": "src/main.py" }
-         → acquired: false, result shows agent "a" holds it
-Agent A: POST /v1/locks/release  { "agent_id": "a", "file_path": "src/main.py" }
-         → released
-```
-
----
-
-## 14. Structured Subtasks
-
-When a message with `kind: "task"` is posted, it is automatically registered in the `tasks` table. Tasks support parent-child relationships via `parent_task_id`.
-
-### Auto-Registration
-
-When `POST /v1/messages` receives a `kind: "task"` message, a row is inserted into `tasks` with `task_id = message.id`. If the request body includes `parent_task_id`, the task is linked as a subtask.
-
-### Completion Rollup
-
-When `POST /v1/tasks/{id}/complete` marks a subtask as done:
-
-1. If all sibling subtasks (same `parent_task_id`) are now done:
-2. The parent task is auto-completed
-3. A `kind: "notice"` message is posted to the parent's channel/thread announcing the rollup
-
-This enables hierarchical task decomposition — post a parent task, break it into subtasks, and the parent auto-completes when all children finish.
-
-### Example
-
-```
-POST /v1/messages  { "kind": "task", "body": "Build the app", ... }
-  → message.id = 1, task_id = 1
-
-POST /v1/messages  { "kind": "task", "body": "Build frontend", "parent_task_id": 1, ... }
-  → message.id = 2, task_id = 2
-
-POST /v1/messages  { "kind": "task", "body": "Build backend", "parent_task_id": 1, ... }
-  → message.id = 3, task_id = 3
-
-POST /v1/tasks/2/complete  → done
-POST /v1/tasks/3/complete  → done, parent_completed: true (task 1 auto-completed)
-```
-
----
-
-## 15. Hub Discovery & PID File
-
-### PID File
-
-When the hub starts, it writes a `.arc.pid` file in the same directory as the SQLite database:
+Request body:
 
 ```json
-{ "pid": 12345, "port": 6969, "url": "http://127.0.0.1:6969" }
+{ "delay_sec": 60 }
 ```
 
-On clean shutdown, the PID file is removed (only if the PID and port match, to avoid removing another instance's file).
+Behavior:
 
-### Discovery Algorithm
+- arms a shutdown timer
+- the reference implementation posts system notices when shutdown is initiated
+  and when it fires
 
-`ensure_hub()` uses PID file discovery before falling back to direct probing:
+#### `POST /v1/shutdown/cancel`
 
-```
-1. Search for .arc.pid upward from CWD and the storage directory
-2. If found, read the URL and probe it
-3. If the probe succeeds → hub is running at that URL
-4. Fall back to probing http://{host}:{port}/v1/channels
-5. If no hub found → start one in the background
-6. Poll until the hub responds or timeout
-```
+Cancels a pending shutdown.
 
-This allows agents in different working directories to find the same hub instance.
+#### `POST /v1/network`
 
-### Bootstrap Algorithm
+Request body:
 
-```
-1. Discover:  Search for .arc.pid, then probe http://{host}:{port}/v1/channels
-2. If 200 OK → hub is running → proceed to register session
-3. If connection refused →
-     a. Start the hub as a background process
-     b. Poll the probe endpoint every 150ms, up to timeout (default 5s)
-     c. If probe succeeds → proceed to register session
-     d. If timeout → report error
-4. Register: POST /v1/sessions with replace: true
-```
-
-**Port binding is the mutex.** Only one process can bind to a port. If two agents race to start the hub, one gets `EADDRINUSE` and the other succeeds. No coordinator needed.
-
-### Reference: `ensure_hub()` API
-
-```
-arc ensure [--host HOST] [--port PORT] [--storage PATH] [--timeout SEC]
-python arc.py ensure [--host HOST] [--port PORT] [--storage PATH] [--timeout SEC]
-```
-
-Returns JSON:
 ```json
-{ "running": true, "started": true, "url": "http://127.0.0.1:6969" }
+{ "allow_remote": true }
 ```
 
----
+This is a reference-implementation runtime toggle and not part of the core
+coordination model.
 
-## 16. Live Dashboard
+#### `GET /`
 
-`GET /` serves a zero-dependency, auto-refreshing HTML dashboard. It fetches data from the API endpoints (`/v1/agents`, `/v1/claims`, `/v1/locks`, `/v1/channels`) and renders:
+Returns an HTML dashboard in the reference implementation.
 
-- **Agents** — active agents with display name and last-seen timestamp
-- **Active Claims** — held claims with owner and expiry
-- **Active Locks** — held file locks with agent and expiry
-- **Channels** — all channels with creator
+## 7. Polling, Replay, and RPC
 
-The page refreshes every 5 seconds. No JavaScript framework — just inline `fetch()` calls.
+### 7.1 Replay Convention
 
----
+Arc uses `since_id` rather than offset pagination.
 
-## 17. Orchestration CLI
+Clients SHOULD:
 
-The `arc orchestrate` command automates the common pattern of seeding a task and waiting for agents to complete:
+1. call `GET /v1/bootstrap?agent_id=...`
+2. store `latest_visible_id`
+3. pass that value as `since_id` in subsequent `GET /v1/events` calls
+4. advance their cursor to the highest seen id
 
-```bash
-arc orchestrate --task "Build the parser" --agents "alpha,beta,gamma" \
-    [--channel NAME] [--thread-id TID] [--timeout 300] [--poll-interval-sec 1]
+### 7.2 Agent-to-Agent RPC
+
+Arc v1 includes a lightweight RPC pattern built on messages.
+
+Request pattern:
+
+- post `kind=task_request`
+- optionally direct it to a specific agent using `to_agent`
+- the request is auto-registered as a task
+
+Result pattern:
+
+- post `kind=task_result`
+- set `reply_to` to the request message id
+
+Hub-side behavior:
+
+- when `task_result.reply_to` targets an open `task_request`, the hub
+  auto-completes the linked task
+- the reference implementation adds `metadata.task_completed = <request_id>` to
+  the stored result message
+
+## 8. State Machines
+
+### 8.1 Session Lifecycle
+
+- active session creation marks the new session active
+- replace or expiry may deactivate the previous active session for that agent
+- mutating activity and active long-poll participation refresh `last_seen`
+- expiry deactivates sessions whose `last_seen` is older than the configured
+  presence TTL
+- on expiry, the hub releases stale claims and locks and posts recovery notices
+
+A hub operating against shared coordination state MUST NOT globally deactivate
+all sessions on startup.
+
+### 8.2 Claim Lifecycle
+
+- acquire: creates a new active claim when no active owner exists
+- same-owner acquire: refreshes the existing active claim
+- different-owner acquire against an active claim: denied with
+  `"acquired": false`
+- release: marks the claim released
+- expiry: inactive after `expires_at`
+- session expiry: hub releases stale claims
+
+### 8.3 Lock Lifecycle
+
+Lock lifecycle is identical to claim lifecycle, keyed by `file_path`.
+
+### 8.4 Task Lifecycle
+
+- `task` and `task_request` message posts create task rows
+- `POST /v1/tasks/{id}/complete` marks a task done
+- `task_result` may auto-complete a linked `task_request`
+- completing all direct children of a parent task auto-completes the parent
+
+## 9. Error Model
+
+Common status codes:
+
+- `200` success
+- `201` created
+- `400` validation or malformed input
+- `404` not found
+- `409` session collision
+
+Error strings are intended to be human-readable. Clients SHOULD NOT depend on
+full-string equality except where they fully control both ends.
+
+## 10. Compatibility Notes
+
+### 10.1 Unknown Fields
+
+Clients SHOULD ignore unknown object fields in success payloads.
+
+Servers MAY reject unknown request fields if they conflict with validation, but
+SHOULD otherwise prefer forward-compatible behavior.
+
+### 10.2 Message Kind Growth
+
+The v1 set of message kinds in §5.1 is closed on the post path: a conforming
+hub MUST reject `POST /v1/messages` with an unknown `kind`. Growth of the set
+is a protocol-version change.
+
+On the read path, a client that receives a message whose `kind` it does not
+understand SHOULD preserve and surface the message rather than drop it, so
+that future protocol versions remain backward-readable.
+
+### 10.3 Hub-Info Growth
+
+Future protocol versions MAY add additional tokens to the `features`
+vocabulary defined in §6.3, or additional top-level fields to the
+`GET /v1/hub-info` response. Clients MUST ignore fields and `features`
+tokens they do not recognize. Hubs MUST NOT repurpose an existing token to
+mean something different from its §6.3 definition; growth happens by adding
+new tokens, not by redefining old ones.
+
+## Appendix A. Reference SQLite Schema
+
+The reference implementation uses SQLite with WAL mode and these tables:
+
+- `channels`
+- `messages`
+- `sessions`
+- `claims`
+- `locks`
+- `tasks`
+
+Reference schema:
+
+```sql
+PRAGMA journal_mode=WAL;
+
+CREATE TABLE IF NOT EXISTS channels (
+    name TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    created_by TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    from_agent TEXT NOT NULL,
+    to_agent TEXT,
+    channel TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    body TEXT NOT NULL,
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    reply_to INTEGER,
+    thread_id TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL DEFAULT '[]',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS claims (
+    claim_key TEXT PRIMARY KEY,
+    thread_id TEXT,
+    task_message_id INTEGER,
+    owner_agent_id TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    released_at TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS locks (
+    file_path TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    locked_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    released_at TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id INTEGER PRIMARY KEY,
+    parent_task_id INTEGER,
+    channel TEXT NOT NULL,
+    thread_id TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
 ```
 
-**What it does**:
+JSON fields are stored as serialized strings in the reference implementation and
+returned decoded at the API boundary.
 
-1. Ensures the hub is running (via `ensure_hub()`)
-2. Creates a channel (auto-named from the task slug if not specified)
-3. Posts the task as `kind: "task"` on the channel
-4. Sends a kickoff DM to each agent with the task, channel, thread, and dashboard URL
-5. Polls the thread for completion signals (artifacts or messages containing "complete"/"done")
-6. Returns a JSON summary with `completed_agents` and `pending_agents`
+## Appendix B. Optional File Relay Binding
 
-**Completion detection**: An agent is considered done when it posts a message with `kind: "artifact"`, or a message containing "complete"/"done"/"finished", or a message with `metadata.complete: true`.
+The reference implementation ships a file-based relay for environments that
+cannot call the hub over HTTP directly.
 
----
+### B.1 Directory Layout
 
-## 18. Interop Contract
+The relay spool uses:
 
-If you implement these 23 endpoints with these exact JSON request/response shapes, any Arc client will work with your server:
+- `requests/<agent_id>/`
+- `responses/<agent_id>/`
 
-| # | Method | Path                         | Function              |
-|---|--------|------------------------------|-----------------------|
-| 1 | GET    | `/`                          | Live dashboard (HTML) |
-| 2 | POST   | `/v1/sessions`               | Create session        |
-| 3 | DELETE | `/v1/sessions/{session_id}`  | Close session         |
-| 4 | GET    | `/v1/agents`                 | List active agents    |
-| 5 | GET    | `/v1/channels`               | List channels         |
-| 6 | POST   | `/v1/channels`               | Create channel        |
-| 7 | GET    | `/v1/hub-info`               | Hub storage metadata  |
-| 8 | POST   | `/v1/messages`               | Post message          |
-| 9 | GET    | `/v1/messages`               | Query messages        |
-| 10| GET    | `/v1/threads`                | List thread summaries |
-| 11| GET    | `/v1/threads/{thread_id}`    | Get thread detail     |
-| 12| GET    | `/v1/events`                 | Unified event feed    |
-| 13| GET    | `/v1/inbox/{agent_id}`       | Agent inbox           |
-| 14| POST   | `/v1/claims`                 | Acquire/refresh claim |
-| 15| POST   | `/v1/claims/refresh`         | Refresh claim lease   |
-| 16| POST   | `/v1/claims/release`         | Release claim         |
-| 17| GET    | `/v1/claims`                 | List claims           |
-| 18| POST   | `/v1/locks`                  | Acquire/refresh lock  |
-| 19| POST   | `/v1/locks/refresh`          | Refresh lock lease    |
-| 20| POST   | `/v1/locks/release`          | Release lock          |
-| 21| GET    | `/v1/locks`                  | List locks            |
-| 22| GET    | `/v1/tasks`                  | List tasks            |
-| 23| POST   | `/v1/tasks/{id}/complete`    | Complete task         |
+### B.2 Request Envelope
 
-**Success envelope**: `{ "ok": true, "result": ... }`  
-**Error envelope**: `{ "ok": false, "error": "..." }`  
-**Claims/Locks acquire or refresh**: Adds `"acquired": true/false` to the envelope.
+Each request file is JSON:
 
-**Timestamp format**: ISO 8601 UTC with seconds precision, `Z` suffix. Example: `2025-01-15T14:30:00Z`.
+```json
+{
+  "request_id": "opaque-id",
+  "agent_id": "worker-a",
+  "method": "POST",
+  "path": "/v1/messages",
+  "body": { "from_agent": "worker-a", "channel": "general", "body": "hi" },
+  "created_at": "2026-04-14T17:00:00Z"
+}
+```
 
----
+Rules:
 
-## 19. Build Your Own
+- `path` MUST begin with `/`
+- `body`, when present, MUST be an object
+- the relay server claims a request by renaming `<id>.json` to `<id>.work`
+- processed `.work` files are retained in the reference implementation
 
-Minimal checklist for building a compatible Arc hub in any language:
+### B.3 Response Envelope
 
-### Storage
-- [ ] Create the six tables: `channels`, `messages`, `sessions`, `claims`, `locks`, `tasks`
-- [ ] Create the indexes for efficient queries
-- [ ] Store JSON fields as serialized strings; parse on read
-- [ ] Use a mutex/lock for concurrent access (SQLite is single-writer)
+Each response file is JSON:
 
-### Bootstrapping
-- [ ] On startup: attempt WAL mode, ensure `general` and `direct` channels
-- [ ] Write `.arc.pid` with `pid`, `port`, and `url`
-- [ ] On shutdown: remove `.arc.pid` if it matches current process
+```json
+{
+  "request_id": "opaque-id",
+  "ok": true,
+  "status": 201,
+  "body": { "ok": true, "result": {} },
+  "completed_at": "2026-04-14T17:00:01Z"
+}
+```
 
-### Sessions
-- [ ] `POST /v1/sessions`: Generate UUID, enforce one-active-per-agent, support `replace`
-- [ ] `DELETE /v1/sessions/{id}`: Set `active = 0`
-- [ ] `GET /v1/agents`: Return active sessions, prune expired ones first
-- [ ] Background timer: prune sessions where `last_seen < now - ttl`
+Transport-level failures use the same top-level envelope with `ok=false` and an
+`error` string. The reference implementation uses statuses such as:
 
-### Messages
-- [ ] `POST /v1/messages`: Validate kind, normalize channel, validate attachments
-- [ ] Auto-register `kind: "task"` messages in the `tasks` table
-- [ ] Support `parent_task_id` for subtask linking
-- [ ] Touch sender's session on message post
-- [ ] `GET /v1/messages`: Support `channel`, `thread_id`, `since_id`, `limit`
-- [ ] `GET /v1/threads`: Return thread summaries with derived status
-- [ ] `GET /v1/threads/{thread_id}`: Return summary plus related messages/tasks/claims/locks
-- [ ] `GET /v1/events`: Return broadcast plus direct messages visible to one agent
-- [ ] `GET /v1/inbox/{agent_id}`: Filter `to_agent = ?`
+- `400` invalid relay request
+- `500` invalid relay response payload
+- `597` spool write failure
+- `598` relay wait timeout
 
-### Claims
-- [ ] `POST /v1/claims`: Atomic acquire with three outcomes: new, refresh, denied
-- [ ] `POST /v1/claims/refresh`: Extend an active lease only when the same owner still holds it
-- [ ] `POST /v1/claims/release`: Only owner can release
-- [ ] `GET /v1/claims`: Support `thread_id` and `active_only` filters
-- [ ] On expired session prune: release stale claims and emit recovery notices
+## Appendix C. Reference Implementation Notes
 
-### File Locks
-- [ ] `POST /v1/locks`: Same acquire semantics as claims, keyed by `file_path`
-- [ ] `POST /v1/locks/refresh`: Extend an active lease only when the same holder still holds it
-- [ ] `POST /v1/locks/release`: Only holder can release
-- [ ] `GET /v1/locks`: Support `agent_id` and `active_only` filters
-- [ ] On expired session prune: release stale locks and emit recovery notices
+The Python reference implementation also ships:
 
-### Tasks
-- [ ] `GET /v1/tasks`: Filter by `parent_id`, `status`, `channel`, `thread_id`
-- [ ] `POST /v1/tasks/{id}/complete`: Mark done, auto-rollup parent if all siblings done
+- `ArcClient` convenience client
+- an MCP adapter
+- a dashboard
+- smoke-test helpers
 
-### Dashboard
-- [ ] `GET /`: Serve HTML dashboard (optional but recommended)
+Those are not normative protocol requirements.
 
-### Hub Introspection
-- [ ] `GET /v1/hub-info`: Return resolved storage path, instance id, and journal/WAL mode
-- [ ] Include `X-Arc-Instance` on responses
+## Appendix D. MCP Adapter
 
-### Validation
-- [ ] `from_agent` is required and non-empty on messages
-- [ ] `owner_agent_id` is required on claims
-- [ ] `agent_id` and `file_path` are required on locks
-- [ ] At least one of `claim_key` or `task_message_id` on acquire
-- [ ] `kind` must be one of: `chat`, `notice`, `task`, `claim`, `release`, `artifact`
-- [ ] Attachment `type` must be one of: `text`, `json`, `code`, `file_ref`, `diff_ref`
-- [ ] `ttl_sec` minimum is 5
-
-### Testing
-Run the reference test suite against your implementation. The reference test suite is in `tests/` and uses only Python stdlib.
-
----
-
-## 20. Deployment Modes
-
-Arc supports two first-class deployment modes.
-
-### Single-Hub Mode
-
-One hub process owns the SQLite database and all agents talk to that one HTTP endpoint.
-
-- Best default for local development
-- Simplest mental model: one `localhost`, one process, one pidfile
-- Recommended when agents share a network namespace
-
-### Shared-Filesystem Mode
-
-Multiple hub processes point at the same SQLite file on a shared or mounted filesystem.
-
-- Best when agents run in isolated sandboxes, containers, or harnesses where `localhost` is not shared
-- Each hub serves its own local agents on its own HTTP port
-- State is shared through the SQLite database, not through cross-agent network access
-- Every hub MUST point at the same SQLite file, not just the same directory
-
-### Shared-Filesystem Requirements
-
-- SQLite WAL mode SHOULD be enabled; hubs SHOULD report the actual `journal_mode`
-- The underlying filesystem must preserve SQLite locking semantics well enough for WAL mode to function correctly
-- Clients SHOULD compare `storage_path` and `instance_id` from `GET /v1/hub-info` when verifying they are on the same shared coordination state
-- Hubs MUST NOT reset every session on startup, because another live hub process may already be using the shared database
-
-### Process Identity vs. Hub Identity
-
-In shared-filesystem mode, different hub processes may expose different local URLs and pidfiles while still representing the same coordination state.
-
-- **Process identity**: local URL, PID, pidfile
-- **Hub identity**: SQLite file plus the stable `instance_id`
-
-`X-Arc-Instance` exists so agents can distinguish these cases cleanly.
+The reference implementation ships an MCP (Model Context Protocol) server
+adapter that exposes Arc as a set of stdio tools for MCP-aware clients. It is
+not part of this specification; see `docs/GUIDE.md` §5 for usage details.

@@ -699,7 +699,22 @@ class HubStore:
     def _cl(self, r): return {"claim_key":r["claim_key"],"thread_id":r["thread_id"],"task_message_id":r["task_message_id"],"owner_agent_id":r["owner_agent_id"],"claimed_at":r["claimed_at"],"expires_at":r["expires_at"],"released_at":r["released_at"],"metadata":json.loads(r["metadata_json"] or "{}")}
 
 # ── Server ────────────────────────────────────────────────────────────
-MSG_KINDS = {"chat","notice","task","claim","release","artifact","task_request","task_result","status_update","code_review"}
+MSG_KINDS = {"chat","notice","task","claim","release","artifact","task_request","task_result"}
+
+# Normative feature tokens advertised in GET /v1/hub-info.
+# See PROTOCOL.md §6.3 for the vocabulary. Clients SHOULD use membership tests,
+# MUST tolerate unknown tokens (forward-compatible), and SHOULD NOT depend on
+# ordering. The reference hub implements all v1 tokens.
+HUB_FEATURES = [
+    "sse",
+    "relay",
+    "long_poll_keepalive",
+    "subtask_rollup",
+    "rpc_kinds",
+    "capability_filter",
+    "shutdown_control",
+    "session_rename",
+]
 ATT_TYPES = {"text","json","code","file_ref","diff_ref"}
 _P = {n: re.compile(p) for n, p in [
     ("sessions", r"^/v1/sessions$"), ("session", r"^/v1/sessions/(?P<id>[^/]+)$"),
@@ -775,7 +790,7 @@ def _parse_timeout(q):
         raise ValueError("timeout must be a number") from e
     return max(0.0, min(t, 60.0))
 
-def _poll_until(fetch_fn, timeout, interval=0.25):
+def _poll_until(fetch_fn, timeout, interval=0.25, on_wait=None):
     """Call fetch_fn() repeatedly until it returns non-empty or timeout expires."""
     if timeout <= 0:
         return fetch_fn()
@@ -784,8 +799,11 @@ def _poll_until(fetch_fn, timeout, interval=0.25):
         rows = fetch_fn()
         if rows:
             return rows
-        if time.monotonic() >= deadline:
+        now = time.monotonic()
+        if now >= deadline:
             return rows
+        if on_wait is not None:
+            on_wait(now)
         time.sleep(interval)
 
 def _parse_since_id(q):
@@ -982,7 +1000,10 @@ class _H(BaseHTTPRequestHandler):
         return {"ok":True,"result":{"storage_path":str(s.db_path),"instance_id":self.server.instance_id,
             "journal_mode":s.journal_mode,"wal_mode":s.wal_enabled,"default_channel":"general",
             "max_body_chars":cfg.max_body_chars,"max_attachment_chars":cfg.max_attachment_chars,
-            "max_attachments":cfg.max_attachments,"allow_remote":cfg.allow_remote}}
+            "max_attachments":cfg.max_attachments,"allow_remote":cfg.allow_remote,
+            "protocol_version":"1",
+            "features":HUB_FEATURES,
+            "message_kinds":sorted(MSG_KINDS)}}
     def _h_network_toggle(self, p, m, q, b):
         if b and "allow_remote" in b: self.server.cfg.allow_remote = bool(b["allow_remote"])
         return {"ok":True,"result":{"allow_remote":self.server.cfg.allow_remote}}
@@ -993,7 +1014,21 @@ class _H(BaseHTTPRequestHandler):
         if ch and s.get_channel(ch) is None: raise _NotFound("channel not found")
         ex = q.get("exclude_self",[""])[0].lower() in ("true","1","yes")
         si = _parse_since_id(q); li = _parse_limit(q, cfg.max_query_limit); to = _parse_timeout(q)
-        return {"ok":True,"result":_poll_until(lambda: s.list_visible_messages_for_agent(aid, since_id=si, limit=li, channel=ch, thread_id=tid, exclude_self=ex), to)}
+        s.touch_agent_session(aid)
+        touch_every = max(1.0, min(30.0, cfg.presence_ttl_sec / 3.0))
+        last_touch = time.monotonic()
+        def _keepalive(now):
+            nonlocal last_touch
+            if now - last_touch >= touch_every:
+                s.touch_agent_session(aid)
+                last_touch = now
+        rows = _poll_until(
+            lambda: s.list_visible_messages_for_agent(aid, since_id=si, limit=li, channel=ch, thread_id=tid, exclude_self=ex),
+            to,
+            on_wait=_keepalive,
+        )
+        s.touch_agent_session(aid)
+        return {"ok":True,"result":rows}
     def _h_stream(self, p, m, q, b):
         """SSE streaming endpoint — keeps connection open and pushes new messages as server-sent events."""
         s = self.server.store; cfg = self.server.cfg
@@ -1683,8 +1718,10 @@ class _HTTPTransport:
     def __init__(self, base_url: str, timeout: float):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-    def call(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        return _http_json(self.base_url, method, path, payload, timeout=self.timeout)
+    def call(self, method: str, path: str, payload: dict[str, Any] | None = None,
+             timeout_override: float | None = None) -> dict[str, Any]:
+        timeout = self.timeout if timeout_override is None else timeout_override
+        return _http_json(self.base_url, method, path, payload, timeout=timeout)
 
 class _RelayTransport:
     """File-spooled transport for sandboxed agents that cannot reach host localhost.
@@ -1697,7 +1734,8 @@ class _RelayTransport:
     """
     def __init__(self, relay_client: "FileRelayClient"):
         self._rc = relay_client
-    def call(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def call(self, method: str, path: str, payload: dict[str, Any] | None = None,
+             timeout_override: float | None = None) -> dict[str, Any]:
         r = self._rc.call(method, path, payload)
         body = r.get("body")
         if isinstance(body, dict): return body
@@ -1729,8 +1767,9 @@ class ArcClient:
         rc = FileRelayClient(agent_id=agent_id, spool_dir=spool_dir, timeout=timeout)
         return cls(agent_id, timeout=timeout, transport=_RelayTransport(rc))
 
-    def _call(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        resp = self._transport.call(method, path, payload)
+    def _call(self, method: str, path: str, payload: dict[str, Any] | None = None,
+              *, timeout_override: float | None = None) -> dict[str, Any]:
+        resp = self._transport.call(method, path, payload, timeout_override=timeout_override)
         if not resp.get("ok"): raise ArcError(resp.get("error", "unknown error"))
         return resp
 
@@ -1767,7 +1806,8 @@ class ArcClient:
         if channel is not None:   q["channel"] = channel
         if thread_id is not None: q["thread_id"] = thread_id
         path = "/v1/events?" + urllib.parse.urlencode(q)
-        msgs = self._call("GET", path)["result"]
+        transport_timeout = max(self.timeout, float(timeout) + 5.0)
+        msgs = self._call("GET", path, timeout_override=transport_timeout)["result"]
         if msgs: self._since_id = max(m["id"] for m in msgs)
         return msgs
 

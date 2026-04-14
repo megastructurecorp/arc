@@ -2,11 +2,12 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
 
-from arc import FileRelayConfig, FileRelayServer, HubConfig, create_server, run_smoke_agent
+from arc import ArcClient, FileRelayConfig, FileRelayServer, HubConfig, create_server, run_smoke_agent
 
 
 def _req(base_url, method, path, payload=None):
@@ -195,6 +196,124 @@ class TestSessionRename(unittest.TestCase):
         self.assertEqual(status, 201)
         status, resp = self._register("foo", replace=False)
         self.assertEqual(status, 409)
+        self.assertFalse(resp["ok"])
+
+
+class TestPollingBehavior(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.config = HubConfig(
+            listen_host="127.0.0.1",
+            port=0,
+            storage_path=os.path.join(self.tempdir.name, "arc.sqlite3"),
+            presence_ttl_sec=5,
+            log_events=False,
+        )
+        self.server = create_server(self.config)
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.server.runtime.start()
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.runtime.stop()
+        self.server.server_close()
+        self.tempdir.cleanup()
+
+    def test_events_long_poll_keeps_session_alive(self):
+        status, resp = _req(self.base_url, "POST", "/v1/sessions", {"agent_id": "poller", "replace": True})
+        self.assertEqual(status, 201, resp)
+
+        for _ in range(3):
+            start = time.time()
+            status, resp = _req(self.base_url, "GET", "/v1/events?agent_id=poller&since_id=0&timeout=2&exclude_self=1")
+            self.assertEqual(status, 200, resp)
+            self.assertEqual(resp["result"], [])
+            self.assertGreaterEqual(time.time() - start, 1.5)
+
+        status, agents = _req(self.base_url, "GET", "/v1/agents")
+        self.assertEqual(status, 200, agents)
+        self.assertIn("poller", [row["agent_id"] for row in agents["result"]])
+
+    def test_arc_client_poll_waits_longer_than_default_http_timeout(self):
+        client = ArcClient("timeout-agent", base_url=self.base_url)
+        client.register(replace=True)
+
+        start = time.time()
+        msgs = client.poll(timeout=16, exclude_self=True)
+        elapsed = time.time() - start
+
+        self.assertEqual(msgs, [])
+        self.assertGreaterEqual(elapsed, 15.0)
+        self.assertLess(elapsed, 22.0)
+
+
+class TestHubInfoCapabilityNegotiation(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.config = HubConfig(
+            listen_host="127.0.0.1",
+            port=0,
+            storage_path=os.path.join(self.tempdir.name, "arc.sqlite3"),
+            log_events=False,
+        )
+        self.server = create_server(self.config)
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.server.runtime.start()
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.runtime.stop()
+        self.server.server_close()
+        self.tempdir.cleanup()
+
+    def test_hub_info_advertises_normative_features_and_kinds(self):
+        status, resp = _req(self.base_url, "GET", "/v1/hub-info")
+        self.assertEqual(status, 200, resp)
+        result = resp["result"]
+
+        # Normative envelope fields per PROTOCOL.md §6.3.
+        self.assertEqual(result["protocol_version"], "1")
+        self.assertIn("instance_id", result)
+        self.assertIn("features", result)
+        self.assertIsInstance(result["features"], list)
+        self.assertIn("message_kinds", result)
+        self.assertIsInstance(result["message_kinds"], list)
+
+        # The reference hub implements every v1 feature token.
+        expected_features = {
+            "sse",
+            "relay",
+            "long_poll_keepalive",
+            "subtask_rollup",
+            "rpc_kinds",
+            "capability_filter",
+            "shutdown_control",
+            "session_rename",
+        }
+        self.assertEqual(set(result["features"]), expected_features)
+
+        # message_kinds must be exactly the v1 closed set of 8.
+        expected_kinds = {
+            "chat", "notice", "task", "claim", "release",
+            "artifact", "task_request", "task_result",
+        }
+        self.assertEqual(set(result["message_kinds"]), expected_kinds)
+
+    def test_post_messages_rejects_unknown_kind(self):
+        status, resp = _req(self.base_url, "POST", "/v1/sessions", {"agent_id": "kind-test", "replace": True})
+        self.assertEqual(status, 201, resp)
+
+        status, resp = _req(self.base_url, "POST", "/v1/messages", {
+            "from_agent": "kind-test",
+            "channel": "general",
+            "kind": "status_update",
+            "body": "ping",
+        })
+        self.assertEqual(status, 400, resp)
         self.assertFalse(resp["ok"])
 
 
