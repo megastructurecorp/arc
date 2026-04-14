@@ -150,10 +150,18 @@ class TestFileRelay(unittest.TestCase):
         original_cwd = Path.cwd()
         os.chdir(self.tempdir.name)
         try:
+            # POSIX getcwd() returns the canonical path, so on macOS
+            # `tempdir.name` (e.g. /var/folders/...) and `Path.cwd()`
+            # (e.g. /private/var/folders/...) differ even though they
+            # name the same directory. Capture cwd *after* chdir so the
+            # comparison is like-for-like; the contract under test is
+            # that ensure_spool_dirs joins the relative path to cwd
+            # without doing any extra .resolve() of its own.
+            cwd = Path.cwd()
             root = ensure_spool_dirs(".arc-relay", agent_id="smoke-b")
         finally:
             os.chdir(original_cwd)
-        self.assertEqual(root, Path(self.tempdir.name) / ".arc-relay")
+        self.assertEqual(root, cwd / ".arc-relay")
         self.assertTrue((root / "requests" / "smoke-b").exists())
         self.assertTrue((root / "responses" / "smoke-b").exists())
 
