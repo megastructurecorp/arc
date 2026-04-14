@@ -176,56 +176,116 @@ The relay is intentionally append-only:
 
 ## Agent Instructions
 
-### Instructions For Normal Agents
+### The Canonical Self-Diagnosing Prompt
 
-Use this when the agent can call the local hub directly:
+The single most important thing to get right when bringing an agent onto Arc
+is the transport choice: does the agent talk to the hub over HTTP, or does it
+talk over the file relay? Picking wrong is silent. An agent that picks HTTP
+when it should have picked relay can run `python arc.py ensure` inside its
+own sandbox, succeed, and then have a monologue on an isolated hub that
+nobody else can see — a "party of one."
 
-> Arc is available in `arc.py`.
-> First ensure the hub is running with `python arc.py ensure`.
-> Then use `http://127.0.0.1:6969`.
-> Register your session, poll for messages, claim work, post artifacts, and release claims when done.
+The fix is not auto-detection, it is a prompt that makes the agent run a
+one-command self-test and branch on the result. Hand this prompt to any
+agent — sandboxed or not — and it will route itself to the correct
+transport. Replace `<your_id>` with the agent's identifier.
 
-### Instructions For Isolated Agents Sharing SQLite
-
-Use this when each sandbox can safely run its own local hub against the same shared database:
-
-> Arc is available in `arc.py`.
-> Start your own local hub pointing at the shared database file:
-> `python arc.py --port <your_port> --storage /shared/arc.sqlite3`
-> Then talk only to your own local hub URL inside that sandbox.
-> Do not try to call another sandbox's localhost.
-
-### Instructions For Constrained Sandboxed Agents
-
-Use this when the agent's sandbox cannot reach the host machine's `localhost` or use SQLite on the shared mount.
-
-**WARNING: DO NOT start your own hub process!**
-If an agent runs `python arc.py ensure` inside an isolated sandbox, it will succeed, but they will be talking to an isolated hub and no other agents will see their messages. The host is ALREADY running the real hub.
-
-Provide the agent with this exact prompt:
-
-> You are operating in a constrained sandbox. You cannot communicate via HTTP or direct SQLite, and you MUST NOT start your own Arc server process. Doing so will isolate you.
-> Instead, interact with the hub exclusively using the file-based relay transport via the `FileRelayClient` class in `arc.py`.
-> The shared relay spool directory is located at `.arc-relay`.
-> 
-> Example Python usage:
+> **Arc bootstrap instructions**
+>
+> Arc is a local coordination hub in `arc.py`. Before using it, run this
+> one command from the repo root and read the output:
+>
+> ```bash
+> py -3 arc.py whoami --agent <your_id>
+> ```
+>
+> Decide your transport based on the result. Do not guess, do not probe,
+> do not try to start your own hub.
+>
+> **Case A — the command returns a JSON object containing a `session`
+> field.** You have direct HTTP access to a running hub. Use the normal
+> client:
+>
 > ```python
 > import arc
-> client = arc.FileRelayClient(agent_id="my-agent-name", spool_dir=".arc-relay")
-> client.call("POST", "/v1/sessions", {"agent_id": "my-agent-name", "replace": True})
-> client.call("POST", "/v1/messages", {"channel": "general", "kind": "chat", "body": "hello"})
+> client = arc.ArcClient("<your_id>")
+> client.register(display_name="<your display name>")
+> client.post("general", "hello")
+> for msg in client.poll(timeout=30):
+>     ...
 > ```
+>
+> **Case B — the command errors with a connection-refused / network-
+> unreachable message, AND there is a `.arc-relay/` directory in your
+> working tree.** You are in a constrained sandbox. The host is already
+> running the real hub; you must talk to it via the file relay. Use:
+>
+> ```python
+> import arc
+> client = arc.ArcClient.over_relay("<your_id>", spool_dir=".arc-relay")
+> client.register(display_name="<your display name>")
+> client.post("general", "hello from the sandbox")
+> for msg in client.poll(timeout=30):
+>     ...
+> ```
+>
+> **Case C — neither of the above.** Stop. Ask the operator. Do not
+> guess.
+>
+> **Hard rules, regardless of case:**
+>
+> - **DO NOT run `python arc.py ensure` yourself in a sandbox.** It will
+>   succeed silently and isolate you from every other agent.
+> - **DO NOT start any other Arc server process.** The host already has
+>   one.
+> - **DO NOT fall back from HTTP to relay on your own.** If HTTP fails
+>   unexpectedly, report it to the operator.
+> - After `register()`, post a one-line "hello" to `#general` and confirm
+>   you see your own message echoed back (or see another agent respond)
+>   before assuming you are connected. A silent `register()` success is
+>   not proof of a working link.
 
-### Instructions You Should Not Give To Constrained Sandboxes
+This prompt is the only one you need for agent onboarding. It covers normal,
+sandboxed, and misconfigured environments with the same text.
 
-Do **not** tell a constrained sandboxed agent to:
+### Why The Self-Test Instead Of A Smart Client
 
-- run `python arc.py ensure` (it will create a silent, isolated "party of one")
-- bootstrap by calling host localhost unless you know it can
-- depend on direct SQLite access unless you know the mount supports it
-- follow the normal single-hub bootstrap blindly
+Arc deliberately does not ship a `connect()` helper that probes HTTP and
+falls back to relay. Auto-detection sounds helpful, but:
 
-For that environment, the right transport is relay mode.
+- An HTTP probe that returns `200` does not prove it reached the *right*
+  hub. A sandboxed agent's own isolated hub would also return `200`.
+- A relay spool directory existing does not prove there is a live relay
+  thread draining it. Stale spools from previous runs look identical.
+- Silent fallback hides the real error. "Hub down" becomes "no reachable
+  hub at `<url>` or relay spool `<dir>`", which mentions two transports
+  that were never both supposed to work.
+- The operator already knows the deployment topology. The agent does not.
+  Moving the transport decision from the operator to a probe is a step
+  backwards on clarity.
+
+The explicit `ArcClient(...)` and `ArcClient.over_relay(...)` constructors
+are the supported API. The self-test above is how an agent picks between
+them without guessing.
+
+### Advanced: Shared-Filesystem Multi-Hub
+
+Use this only when each sandbox can safely run its own local hub against a
+shared SQLite file on a filesystem with working locking:
+
+> Arc is available in `arc.py`. Start your own local hub pointing at the
+> shared database file:
+>
+> ```bash
+> python arc.py --port <your_port> --storage /shared/arc.sqlite3
+> ```
+>
+> Then talk only to your own local hub URL inside that sandbox. Do not try
+> to call another sandbox's localhost. Do not share ports across sandboxes.
+
+This mode is exotic. If you are not certain your filesystem supports SQLite
+WAL locking across the mount, prefer the relay transport (Case B above)
+instead.
 
 ## Smoke Validation
 
