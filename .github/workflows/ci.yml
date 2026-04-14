@@ -63,40 +63,58 @@ jobs:
       - name: Arc CLI smoke — start, post, poll, stop
         shell: bash
         run: |
+          # We deliberately do NOT use `arc ensure` here. `arc ensure`
+          # uses subprocess.Popen with stderr=DEVNULL and
+          # start_new_session=True, which on macOS framework Python can
+          # silently hang or detach the hub child without surfacing any
+          # error. Starting the hub in the foreground with `&` keeps
+          # stderr attached to the CI log, so any startup error is
+          # visible immediately.
+
           # Belt-and-braces cleanup in case the unit tests (which ran in
-          # the previous step) leaked a stale .arc.pid or sqlite WAL into
-          # CWD. Tests use ephemeral ports, but they do call
-          # runtime.start() which writes a pidfile.
+          # the previous step) leaked a stale .arc.pid or sqlite WAL.
           rm -f .arc.pid arc.sqlite3 arc.sqlite3-shm arc.sqlite3-wal
 
-          # --timeout 30 (vs. arc.py default of 5s) gives the spawned
-          # hub child enough time to cold-import arc.py, open SQLite,
-          # and bind its port on slow CI runners. macOS ARM64 hosted
-          # runners are the tight constraint here.
-          set +e
-          arc ensure --timeout 30
-          rc=$?
-          set -e
-          if [ $rc -ne 0 ]; then
-            echo "=== arc ensure failed (rc=$rc); collecting diagnostics ==="
-            echo "--- ps for arc processes ---"
-            ps -ef 2>/dev/null | grep -i 'arc.py\|megastructure' | grep -v grep || echo "(none)"
-            echo "--- listening on port 6969 ---"
+          # Start the hub in the background. stderr inherits the CI
+          # log so any traceback from the hub appears in this step.
+          arc --port 6969 --storage arc.sqlite3 --quiet &
+          HUB_PID=$!
+          echo "spawned hub pid=$HUB_PID"
+
+          # Poll for readiness up to 30 seconds, but bail early if the
+          # process dies — that gives a concrete error instead of a
+          # generic timeout.
+          ready=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:6969/v1/hub-info >/dev/null 2>&1; then
+              echo "hub responsive after ${i}s"
+              ready=1
+              break
+            fi
+            if ! kill -0 $HUB_PID 2>/dev/null; then
+              echo "hub pid $HUB_PID died after ${i}s — see stderr above"
+              wait $HUB_PID 2>/dev/null
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ $ready -ne 1 ]; then
+            echo "=== hub still not responsive after 30s; diagnostics ==="
+            ps -p $HUB_PID -o pid,ppid,stat,etime,command || true
             (lsof -nP -i :6969 2>/dev/null \
-              || ss -ltn 2>/dev/null | grep ':6969' \
               || netstat -an 2>/dev/null | grep 6969) || echo "(nothing on 6969)"
-            echo "--- pidfile ---"
-            (cat .arc.pid 2>/dev/null && echo) || echo "(no .arc.pid)"
-            echo "--- sqlite files in CWD ---"
-            ls -la arc.sqlite3* 2>/dev/null || echo "(no sqlite files)"
-            echo "--- arc --version ---"
-            arc --version || echo "(arc not on PATH?)"
+            kill -9 $HUB_PID 2>/dev/null || true
             exit 1
           fi
 
-          arc post --agent ci-smoke "hello from CI on ${{ matrix.os }}"
-          arc poll --agent ci-smoke --timeout 3 --include-self
-          arc stop
+          arc post --agent ci-smoke --base-url http://127.0.0.1:6969 "hello from CI on ${{ matrix.os }}"
+          arc poll --agent ci-smoke --base-url http://127.0.0.1:6969 --timeout 3 --include-self
+
+          # Clean shutdown, then wait for the process to exit so its
+          # final stderr (if any) makes it into the log.
+          kill $HUB_PID 2>/dev/null || true
+          wait $HUB_PID 2>/dev/null || true
 
       - name: Version sync — arc.py __version__ matches package.json version
         shell: python
