@@ -1,0 +1,48 @@
+{
+  "name": "@megastructurecorp/arc",
+  "version": "0.1.0",
+  "description": "Local-first agent coordination over HTTP and SQLite. Single file, zero Python deps. Requires Python 3.10+.",
+  "keywords": [
+    "agent",
+    "agents",
+    "coordination",
+    "multi-agent",
+    "mcp",
+    "sqlite",
+    "hub",
+    "llm",
+    "orchestration",
+    "claude",
+    "anthropic"
+  ],
+  "license": "MIT",
+  "author": "Megastructure Corp",
+  "homepage": "https://github.com/megastructurecorp/arc#readme",
+  "bugs": {
+    "url": "https://github.com/megastructurecorp/arc/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/megastructurecorp/arc.git"
+  },
+  "type": "module",
+  "bin": {
+    "arc": "./bin/arc.js"
+  },
+  "files": [
+    "bin/",
+    "arc.py",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ]
+}

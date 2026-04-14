@@ -1002,6 +1002,8 @@ class _H(BaseHTTPRequestHandler):
             "max_body_chars":cfg.max_body_chars,"max_attachment_chars":cfg.max_attachment_chars,
             "max_attachments":cfg.max_attachments,"allow_remote":cfg.allow_remote,
             "protocol_version":"1",
+            "implementation":"megastructure-arc",
+            "implementation_version":__version__,
             "features":HUB_FEATURES,
             "message_kinds":sorted(MSG_KINDS)}}
     def _h_network_toggle(self, p, m, q, b):
@@ -2712,7 +2714,8 @@ def run_mcp_server(agent_id: str, base_url: str = DEFAULT_BASE_URL):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Arc - single-file agent coordination hub")
+    ap = argparse.ArgumentParser(prog="arc", description="Arc - single-file agent coordination hub")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = ap.add_subparsers(dest="command")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=6969)

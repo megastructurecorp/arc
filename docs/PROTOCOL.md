@@ -453,6 +453,8 @@ are advertised.
   "result": {
     "instance_id": "mh1-...",
     "protocol_version": "1",
+    "implementation": "megastructure-arc",
+    "implementation_version": "0.1.0",
     "default_channel": "general",
     "max_body_chars": 128000,
     "max_attachment_chars": 256000,
@@ -495,6 +497,13 @@ Normative requirements:
 - `storage_path`, `journal_mode`, `wal_mode`, and `allow_remote` are
   reference-implementation details. Clients MUST treat them as informational
   and MUST NOT depend on them for interoperability.
+- `implementation` and `implementation_version`, when present, are
+  informational identifiers for the hub's software identity and version.
+  They are added per §10.3 "Hub-Info Growth" and are not part of the CORE
+  profile. Clients MAY surface them for debugging, logging, or telemetry
+  but MUST NOT use them for feature detection — feature negotiation MUST
+  go through `features` (see "features vocabulary" below). A hub MAY omit
+  either or both fields.
 
 #### `features` vocabulary
 

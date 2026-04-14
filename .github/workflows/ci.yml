@@ -1,0 +1,97 @@
+name: CI
+
+# Arc CI — runs on every push to main and every pull request.
+#
+# What gets checked:
+#   1. Package installs cleanly from source via `pip install -e .`
+#      (exercises pyproject.toml / hatchling build backend)
+#   2. `arc --version` prints correctly from the installed console script
+#   3. Full unit test suite (tests/) — exercises the hub, the client,
+#      the file relay, and the smoke-agent runner end-to-end
+#   4. CLI smoke — start a real hub, post a message, poll it back, stop
+#      (exercises the packaged CLI, not just the test harness internals)
+#   5. Version sync — arc.py __version__ must equal package.json version
+#   6. npm shim smoke — node bin/arc.js --version must succeed end-to-end,
+#      proving the JS shim can locate Python and forward argv
+#
+# Matrix is deliberately narrow to keep CI time under a few minutes:
+# all four supported Python versions on Linux (the most common deploy
+# target), plus the latest Python on macOS and Windows to catch
+# platform-specific bugs in subprocess / path / stdio handling.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  python: "3.10" }
+          - { os: ubuntu-latest,  python: "3.11" }
+          - { os: ubuntu-latest,  python: "3.12" }
+          - { os: ubuntu-latest,  python: "3.13" }
+          - { os: macos-latest,   python: "3.13" }
+          - { os: windows-latest, python: "3.13" }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install arc from source
+        run: pip install -e .
+
+      - name: Print installed version
+        run: arc --version
+
+      - name: Run test suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Arc CLI smoke — start, post, poll, stop
+        shell: bash
+        run: |
+          set -e
+          arc ensure
+          arc post --agent ci-smoke "hello from CI on ${{ matrix.os }}"
+          arc poll --agent ci-smoke --timeout 3 --include-self
+          arc stop
+
+      - name: Version sync — arc.py __version__ matches package.json version
+        shell: python
+        run: |
+          import json, re, sys
+          py_src = open('arc.py', encoding='utf-8').read()
+          py_ver = re.search(r'__version__\s*=\s*"([^"]+)"', py_src).group(1)
+          js_ver = json.load(open('package.json', encoding='utf-8'))['version']
+          print(f"arc.py:       {py_ver}")
+          print(f"package.json: {js_ver}")
+          if py_ver != js_ver:
+              sys.exit(f"version mismatch: arc.py={py_ver} package.json={js_ver}")
+          print("versions in sync")
+
+  npm-shim:
+    name: npm shim smoke (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Shim forwards --version to bundled arc.py
+        run: node bin/arc.js --version

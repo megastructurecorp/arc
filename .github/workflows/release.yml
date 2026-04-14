@@ -1,0 +1,169 @@
+name: Release
+
+# Arc release workflow — triggered when you push a tag matching v*.*.*
+# (for example: v0.1.0, v0.2.0, v1.0.0-rc1).
+#
+# What it does, in order:
+#
+#   1. guard         — verify the tag version matches arc.py __version__
+#                      and package.json version; refuse to publish on
+#                      mismatch. Also runs the full test suite so a red
+#                      tag never ships.
+#   2. build-python  — python -m build → sdist + wheel
+#   3. publish-pypi  — pypa/gh-action-pypi-publish via PyPI Trusted
+#                      Publishing (OIDC). NO API TOKEN STORED.
+#   4. publish-npm   — npm publish --access public via a Granular Access
+#                      Token in the NPM_TOKEN repo secret.
+#   5. github-release — softprops/action-gh-release creates a GH Release
+#                       with auto-generated notes and attaches the Python
+#                       artifacts.
+#
+# One-time setup you must do before the first release:
+#
+#   PyPI Trusted Publishing:
+#     https://pypi.org/manage/project/megastructure-arc/settings/publishing/
+#     Add a trusted publisher:
+#       owner      = megastructurecorp
+#       repository = arc
+#       workflow   = release.yml
+#       environment = pypi
+#
+#   npm Granular Access Token:
+#     https://www.npmjs.com/settings/megarod/tokens
+#     Create a Granular Access Token scoped to @megastructurecorp/arc
+#     (Publish permission). Store as repo secret NPM_TOKEN.
+#
+#   GitHub environment:
+#     Settings → Environments → New environment → "pypi"
+#     (No secrets or reviewers needed — Trusted Publishing uses the
+#     environment name as part of the OIDC claim.)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Pre-publish guard
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Extract version from tag
+        id: ver
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "tag version: $ver"
+
+      - name: Version consistency — tag, arc.py, package.json
+        shell: python
+        run: |
+          import json, os, re, sys
+          tag_ver = os.environ["TAG_VERSION"]
+          py_src = open('arc.py', encoding='utf-8').read()
+          py_ver = re.search(r'__version__\s*=\s*"([^"]+)"', py_src).group(1)
+          js_ver = json.load(open('package.json', encoding='utf-8'))['version']
+          print(f"tag:          {tag_ver}")
+          print(f"arc.py:       {py_ver}")
+          print(f"package.json: {js_ver}")
+          if tag_ver != py_ver or tag_ver != js_ver:
+              sys.exit("version mismatch — refusing to publish")
+          print("all versions agree")
+        env:
+          TAG_VERSION: ${{ steps.ver.outputs.version }}
+
+      - name: Install and run full test suite
+        run: |
+          pip install -e .
+          arc --version
+          python -m unittest discover -s tests -v
+
+  build-python:
+    name: Build Python sdist + wheel
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install build frontend
+        run: pip install build
+      - name: Build sdist and wheel
+        run: python -m build
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+
+  publish-pypi:
+    name: Publish to PyPI (Trusted Publishing)
+    needs: [guard, build-python]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/megastructure-arc
+    permissions:
+      id-token: write   # required for OIDC handshake with PyPI
+      contents: read
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No username/password/token — OIDC trusted publishing.
+        # Configure at https://pypi.org/manage/project/megastructure-arc/settings/publishing/
+
+  publish-npm:
+    name: Publish to npm
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - name: Show what will be published (dry run)
+        run: npm pack --dry-run
+      - name: Publish
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  github-release:
+    name: Create GitHub Release
+    needs: [publish-pypi, publish-npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Arc ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*

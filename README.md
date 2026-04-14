@@ -1,8 +1,40 @@
 # Arc
 
+[![PyPI](https://img.shields.io/pypi/v/megastructure-arc.svg)](https://pypi.org/project/megastructure-arc/)
+[![npm](https://img.shields.io/npm/v/%40megastructurecorp%2Farc.svg)](https://www.npmjs.com/package/@megastructurecorp/arc)
+[![Python](https://img.shields.io/pypi/pyversions/megastructure-arc.svg)](https://pypi.org/project/megastructure-arc/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
+[![CI](https://github.com/megastructurecorp/arc/actions/workflows/ci.yml/badge.svg)](https://github.com/megastructurecorp/arc/actions/workflows/ci.yml)
+
 Local-first agent coordination over HTTP and SQLite, with a file-relay mode for sandboxed agents that cannot reach host localhost or safely use SQLite on the shared mount.
 
-This repo ships one canonical implementation: [`arc.py`](./arc.py).
+One canonical implementation in [`arc.py`](./arc.py). Single Python file. Zero runtime dependencies. Python 3.10+. MIT.
+
+## Install
+
+Three ways to get Arc:
+
+```bash
+# PyPI
+pip install megastructure-arc
+
+# npm (preferred for MCP hosts — Claude Desktop, Cursor, Cline, Claude Code, etc.)
+npm install -g @megastructurecorp/arc
+# …or inline without a global install:
+#   npx -y @megastructurecorp/arc ensure
+
+# From source
+git clone https://github.com/megastructurecorp/arc
+cd arc && python3 arc.py ensure
+```
+
+Verify:
+
+```bash
+arc --version     # "arc 0.1.0"
+```
+
+The `pip` and `npm` packages install an `arc` command on your `PATH`. The npm package is a thin shim that locates a local Python 3.10+ interpreter and runs the bundled `arc.py` — **you still need Python installed to use the npm package.** The shim exists because most MCP hosts are JavaScript-native and install agent tools via `npx`, so shipping only to PyPI leaves a large ergonomic gap.
 
 ## What It Supports
 
@@ -20,7 +52,7 @@ This repo ships one canonical implementation: [`arc.py`](./arc.py).
 Start the hub (idempotent — safe to run multiple times):
 
 ```bash
-python arc.py ensure
+arc ensure
 ```
 
 The hub runs in the background on `http://127.0.0.1:6969`. Open that URL in a browser to see the live dashboard.
@@ -30,26 +62,28 @@ The relay for sandboxed agents starts automatically alongside the hub — no ext
 Stop the hub (and relay):
 
 ```bash
-python arc.py stop
+arc stop
 ```
 
 Stop the hub and delete all data (sessions, messages, claims, locks, tasks):
 
 ```bash
-python arc.py reset
+arc reset
 ```
 
 All commands accept `--host`, `--port`, `--storage`, and `--spool-dir` flags if you're not using the defaults.
 
+If you are running from a git clone without installing, substitute `py -3 arc.py ensure` (Windows) or `python3 arc.py ensure` (macOS / Linux) for `arc ensure` anywhere in this README. Everything else is identical.
+
 ## Talking To The Hub Without curl
 
-Arc ships a small CLI built on the new `ArcClient` class so you never need to hand-roll HTTP requests:
+Arc ships a small CLI built on the `ArcClient` class so you never need to hand-roll HTTP requests:
 
 ```bash
-python arc.py post   --agent me "hello from the cli"
-python arc.py post   --agent me --to teammate "private ping"
-python arc.py poll   --agent me --timeout 30
-python arc.py whoami --agent me
+arc post   --agent me "hello from the cli"
+arc post   --agent me --to teammate "private ping"
+arc poll   --agent me --timeout 30
+arc whoami --agent me
 ```
 
 `poll` defaults to `exclude_self=true` (you will not see your own messages echoed back) and uses long-poll. `post --agent me` implicitly registers the session with `replace=true`, which will evict any bot already running under that `agent_id` — use a distinct id when interleaving with a live agent.
@@ -76,11 +110,13 @@ for msg in client.poll(timeout=30):     # still exclude_self by default, still t
     ...
 ```
 
-The host must already be running `python arc.py ensure`; the relay thread starts automatically as part of the hub. Hub-level errors (400, 404, 409) round-trip through the relay as `arc.ArcError` with the original error text intact.
+The host must already be running `arc ensure`; the relay thread starts automatically as part of the hub. Hub-level errors (400, 404, 409) round-trip through the relay as `arc.ArcError` with the original error text intact.
 
-## Using Arc On Windows
+## Running From Source on Windows
 
-On fresh Windows 11 installs, `python` is often aliased to the Microsoft Store shim and will not run the script. Use the official launcher instead:
+**If you installed via `pip` or `npm`, skip this section — you already have an `arc` command on `PATH` that handles everything below automatically.**
+
+On fresh Windows 11 installs, `python` is often aliased to the Microsoft Store shim and will not run scripts. If you are running Arc from a git clone, use the official Python launcher instead:
 
 ```powershell
 py -3 arc.py ensure
@@ -102,7 +138,7 @@ py -3 arc.py poll --agent me --timeout 30
    curl.exe --data-binary "@msg.json" -H "Content-Type: application/json" http://127.0.0.1:6969/v1/messages
    ```
 
-Better yet, skip curl and use the built-in CLI: `py -3 arc.py post --agent me "hi"` handles quoting and encoding correctly on every shell.
+Better yet, skip curl and use the built-in CLI: `arc post --agent me "hi"` handles quoting and encoding correctly on every shell. If the Python console mangles non-ASCII output (em-dashes, curly quotes, emoji), set `PYTHONIOENCODING=utf-8` in your environment — the hub stores UTF-8 correctly regardless, this only affects what your terminal prints back.
 
 ## Choose The Right Mode
 
@@ -113,7 +149,7 @@ Use this when all agents can reach the same local HTTP server.
 Start the hub:
 
 ```bash
-python arc.py ensure
+arc ensure
 ```
 
 Default URL:
@@ -134,10 +170,10 @@ Example:
 
 ```bash
 # Sandbox A
-python arc.py --port 6969 --storage /shared/arc.sqlite3
+arc --port 6969 --storage /shared/arc.sqlite3
 
 # Sandbox B
-python arc.py --port 9876 --storage /shared/arc.sqlite3
+arc --port 9876 --storage /shared/arc.sqlite3
 ```
 
 Each sandbox talks only to its own local hub. All hubs share the same coordination state through the same SQLite file.
@@ -159,13 +195,13 @@ In this mode:
 Start the host side:
 
 ```bash
-python arc.py ensure
+arc ensure
 ```
 
 The relay is built in and starts automatically. To use a custom spool directory:
 
 ```bash
-python arc.py ensure --spool-dir .arc-relay
+arc ensure --spool-dir .arc-relay
 ```
 
 The relay is intentionally append-only:
@@ -181,9 +217,9 @@ The relay is intentionally append-only:
 The single most important thing to get right when bringing an agent onto Arc
 is the transport choice: does the agent talk to the hub over HTTP, or does it
 talk over the file relay? Picking wrong is silent. An agent that picks HTTP
-when it should have picked relay can run `python arc.py ensure` inside its
-own sandbox, succeed, and then have a monologue on an isolated hub that
-nobody else can see — a "party of one."
+when it should have picked relay can run `arc ensure` inside its own sandbox,
+succeed, and then have a monologue on an isolated hub that nobody else can
+see — a "party of one."
 
 The fix is not auto-detection, it is a prompt that makes the agent run a
 one-command self-test and branch on the result. Hand this prompt to any
@@ -192,11 +228,19 @@ transport. Replace `<your_id>` with the agent's identifier.
 
 > **Arc bootstrap instructions**
 >
-> Arc is a local coordination hub in `arc.py`. Before using it, run this
-> one command from the repo root and read the output:
+> Arc is a coordination hub. Before using it, run this one command and
+> read the output:
 >
 > ```bash
-> py -3 arc.py whoami --agent <your_id>
+> arc whoami --agent <your_id>
+> ```
+>
+> If `arc` is not on your `PATH` (e.g. you are running from a git clone
+> without installing), use one of these equivalents instead:
+>
+> ```bash
+> py -3 arc.py whoami --agent <your_id>       # Windows, git clone
+> python3 arc.py whoami --agent <your_id>     # macOS / Linux, git clone
 > ```
 >
 > Decide your transport based on the result. Do not guess, do not probe,
@@ -234,8 +278,10 @@ transport. Replace `<your_id>` with the agent's identifier.
 >
 > **Hard rules, regardless of case:**
 >
-> - **DO NOT run `python arc.py ensure` yourself in a sandbox.** It will
->   succeed silently and isolate you from every other agent.
+> - **DO NOT start your own Arc hub in a sandbox.** Not `arc ensure`, not
+>   `py -3 arc.py ensure`, not `python3 arc.py ensure`, not any other form.
+>   Starting a second hub will succeed silently and isolate you from every
+>   other agent on the real one.
 > - **DO NOT start any other Arc server process.** The host already has
 >   one.
 > - **DO NOT fall back from HTTP to relay on your own.** If HTTP fails
@@ -244,6 +290,11 @@ transport. Replace `<your_id>` with the agent's identifier.
 >   you see your own message echoed back (or see another agent respond)
 >   before assuming you are connected. A silent `register()` success is
 >   not proof of a working link.
+> - If you need to know which hub implementation you are talking to
+>   (useful when multiple agents coordinate across versions), read the
+>   `implementation` and `implementation_version` fields from
+>   `GET /v1/hub-info`. They are informational only — do not use them for
+>   feature detection, use `features` instead.
 
 This prompt is the only one you need for agent onboarding. It covers normal,
 sandboxed, and misconfigured environments with the same text.
@@ -277,7 +328,7 @@ shared SQLite file on a filesystem with working locking:
 > shared database file:
 >
 > ```bash
-> python arc.py --port <your_port> --storage /shared/arc.sqlite3
+> arc --port <your_port> --storage /shared/arc.sqlite3
 > ```
 >
 > Then talk only to your own local hub URL inside that sandbox. Do not try
@@ -294,11 +345,11 @@ Arc includes a deterministic smoke runner inside the same file.
 Example mixed validation:
 
 ```bash
-python arc.py ensure
+arc ensure
 
-python arc.py smoke-agent --role smoke-a --transport http
-python arc.py smoke-agent --role smoke-b --transport relay --relay-dir .arc-relay
-python arc.py smoke-agent --role smoke-c --transport http
+arc smoke-agent --role smoke-a --transport http
+arc smoke-agent --role smoke-b --transport relay --relay-dir .arc-relay
+arc smoke-agent --role smoke-c --transport http
 ```
 
 This validates that:
@@ -310,11 +361,12 @@ This validates that:
 ## Common Commands
 
 ```bash
-python arc.py ensure                # start hub (idempotent)
-python arc.py stop                  # stop the running hub
-python arc.py reset                 # stop hub + delete database
-python arc.py --port 6969           # run hub + relay in foreground
-python arc.py smoke-agent --role smoke-b --transport relay --relay-dir .arc-relay
+arc --version                       # print installed version
+arc ensure                          # start hub (idempotent)
+arc stop                            # stop the running hub
+arc reset                           # stop hub + delete database
+arc --port 6969                     # run hub + relay in foreground
+arc smoke-agent --role smoke-b --transport relay --relay-dir .arc-relay
 curl http://127.0.0.1:6969/v1/hub-info
 curl http://127.0.0.1:6969/v1/threads
 curl "http://127.0.0.1:6969/v1/messages?thread_id=demo-thread"

@@ -17,48 +17,64 @@ The reference implementation in `arc.py` includes:
 
 ## 2. Starting the Reference Hub
 
+After `pip install megastructure-arc` or `npm install -g @megastructurecorp/arc`,
+the `arc` command is on `PATH`. From a git clone, use `py -3 arc.py` on Windows
+or `python3 arc.py` on macOS / Linux.
+
 Typical startup:
 
 ```bash
-py -3 arc.py ensure
+arc ensure                # pip / npm install
+py -3 arc.py ensure       # Windows, git clone
+python3 arc.py ensure     # macOS / Linux, git clone
 ```
 
 Typical stop:
 
 ```bash
-py -3 arc.py stop
+arc stop
 ```
 
 Reset the local database:
 
 ```bash
-py -3 arc.py reset
+arc reset
 ```
+
+The rest of this guide uses the `arc` command form; substitute one of the
+`arc.py` forms if you are running from a git clone.
 
 ## 3. Useful CLI Commands
 
 Post to a channel:
 
 ```bash
-py -3 arc.py post --agent me --channel general "hello"
+arc post --agent me --channel general "hello"
 ```
 
 Send a direct message:
 
 ```bash
-py -3 arc.py post --agent me --to teammate "ping"
+arc post --agent me --to teammate "ping"
 ```
 
 Poll visible traffic:
 
 ```bash
-py -3 arc.py poll --agent me --timeout 5
+arc poll --agent me --timeout 5
 ```
 
 Bootstrap and inspect current session state:
 
 ```bash
-py -3 arc.py whoami --agent me
+arc whoami --agent me
+```
+
+Print the installed version (useful for bug reports and multi-agent setups
+where you need to know which hub implementation each participant is running):
+
+```bash
+arc --version
 ```
 
 ## 4. Deployment Modes
@@ -91,8 +107,8 @@ The adapter runs as a stdio JSON-RPC 2.0 server and expects the Arc hub to
 already be running locally:
 
 ```bash
-py -3 arc.py ensure
-py -3 arc.py mcp --agent my-mcp-agent --base-url http://127.0.0.1:6969
+arc ensure
+arc mcp --agent my-mcp-agent --base-url http://127.0.0.1:6969
 ```
 
 It registers an Arc session using `ArcClient.quickstart(agent_id)` on startup,
@@ -119,26 +135,69 @@ message.
 
 ### 5.3 Example Claude Desktop / Claude Code Config
 
-An `mcpServers` entry typically looks like:
+The shape of your `mcpServers` entry depends on how Arc is installed. All
+four variants below do the same thing: spawn the Arc MCP adapter and register
+a session with `agent_id = "claude-desktop"`.
+
+**After `pip install megastructure-arc`** (the `arc` console script is on `PATH`):
+
+```json
+{
+  "mcpServers": {
+    "arc": {
+      "command": "arc",
+      "args": ["mcp", "--agent", "claude-desktop", "--base-url", "http://127.0.0.1:6969"]
+    }
+  }
+}
+```
+
+**Via `npx` from the npm package** (no global install required — npm caches
+the package on first use; a working Python 3.10+ must also be on `PATH`):
+
+```json
+{
+  "mcpServers": {
+    "arc": {
+      "command": "npx",
+      "args": ["-y", "@megastructurecorp/arc", "mcp", "--agent", "claude-desktop", "--base-url", "http://127.0.0.1:6969"]
+    }
+  }
+}
+```
+
+**From a git clone on Windows** (`py -3` is the reliable Python launcher on
+fresh Windows installs; use forward slashes in the JSON path):
 
 ```json
 {
   "mcpServers": {
     "arc": {
       "command": "py",
-      "args": [
-        "-3",
-        "C:/path/to/arc.py",
-        "mcp",
-        "--agent", "claude-desktop",
-        "--base-url", "http://127.0.0.1:6969"
-      ]
+      "args": ["-3", "C:/path/to/arc.py", "mcp", "--agent", "claude-desktop", "--base-url", "http://127.0.0.1:6969"]
     }
   }
 }
 ```
 
-Unix hosts should use the absolute path to `python3` and forward-slash paths.
+**From a git clone on macOS / Linux**:
+
+```json
+{
+  "mcpServers": {
+    "arc": {
+      "command": "python3",
+      "args": ["/path/to/arc.py", "mcp", "--agent", "claude-desktop", "--base-url", "http://127.0.0.1:6969"]
+    }
+  }
+}
+```
+
+The `pip` and `npx` variants are what most MCP hosts expect — they assume a
+command name or an `npx` package name rather than an absolute path. The
+`--base-url` in every variant points at a hub you must already be running
+locally (`arc ensure`). If the hub is not up, the MCP adapter will still
+launch, but every tool call will fail until the hub comes back.
 
 ### 5.4 Framing and Protocol Version
 
@@ -168,10 +227,13 @@ For raw HTTP examples, prefer the built-in CLI or PowerShell's
 The reference repo includes a deterministic smoke runner. Example:
 
 ```bash
-py -3 arc.py smoke-agent --role smoke-a --transport http
-py -3 arc.py smoke-agent --role smoke-b --transport relay --relay-dir .arc-relay
-py -3 arc.py smoke-agent --role smoke-c --transport http
+arc smoke-agent --role smoke-a --transport http
+arc smoke-agent --role smoke-b --transport relay --relay-dir .arc-relay
+arc smoke-agent --role smoke-c --transport http
 ```
+
+These run in the foreground and exit non-zero on failure — wire them into
+CI as a post-install sanity check.
 
 ## 8. Notes for Spec Authors
 
