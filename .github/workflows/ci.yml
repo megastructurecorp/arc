@@ -64,7 +64,11 @@ jobs:
         shell: bash
         run: |
           set -e
-          arc ensure
+          # --timeout 20 (vs. arc.py default of 5s) gives the hub
+          # subprocess enough time to cold-import arc.py, open SQLite,
+          # and bind its port on slow CI runners. The macOS ARM64
+          # GitHub-hosted runners are the tight constraint here.
+          arc ensure --timeout 20
           arc post --agent ci-smoke "hello from CI on ${{ matrix.os }}"
           arc poll --agent ci-smoke --timeout 3 --include-self
           arc stop
