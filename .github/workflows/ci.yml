@@ -63,12 +63,37 @@ jobs:
       - name: Arc CLI smoke — start, post, poll, stop
         shell: bash
         run: |
+          # Belt-and-braces cleanup in case the unit tests (which ran in
+          # the previous step) leaked a stale .arc.pid or sqlite WAL into
+          # CWD. Tests use ephemeral ports, but they do call
+          # runtime.start() which writes a pidfile.
+          rm -f .arc.pid arc.sqlite3 arc.sqlite3-shm arc.sqlite3-wal
+
+          # --timeout 30 (vs. arc.py default of 5s) gives the spawned
+          # hub child enough time to cold-import arc.py, open SQLite,
+          # and bind its port on slow CI runners. macOS ARM64 hosted
+          # runners are the tight constraint here.
+          set +e
+          arc ensure --timeout 30
+          rc=$?
           set -e
-          # --timeout 20 (vs. arc.py default of 5s) gives the hub
-          # subprocess enough time to cold-import arc.py, open SQLite,
-          # and bind its port on slow CI runners. The macOS ARM64
-          # GitHub-hosted runners are the tight constraint here.
-          arc ensure --timeout 20
+          if [ $rc -ne 0 ]; then
+            echo "=== arc ensure failed (rc=$rc); collecting diagnostics ==="
+            echo "--- ps for arc processes ---"
+            ps -ef 2>/dev/null | grep -i 'arc.py\|megastructure' | grep -v grep || echo "(none)"
+            echo "--- listening on port 6969 ---"
+            (lsof -nP -i :6969 2>/dev/null \
+              || ss -ltn 2>/dev/null | grep ':6969' \
+              || netstat -an 2>/dev/null | grep 6969) || echo "(nothing on 6969)"
+            echo "--- pidfile ---"
+            (cat .arc.pid 2>/dev/null && echo) || echo "(no .arc.pid)"
+            echo "--- sqlite files in CWD ---"
+            ls -la arc.sqlite3* 2>/dev/null || echo "(no sqlite files)"
+            echo "--- arc --version ---"
+            arc --version || echo "(arc not on PATH?)"
+            exit 1
+          fi
+
           arc post --agent ci-smoke "hello from CI on ${{ matrix.os }}"
           arc poll --agent ci-smoke --timeout 3 --include-self
           arc stop
