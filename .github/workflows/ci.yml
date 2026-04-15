@@ -119,11 +119,61 @@ jobs:
           (cat .arc.pid 2>/dev/null && echo) || echo "(no .arc.pid)"
           echo
 
-          echo "--- cleanup ---"
+          echo "--- cleanup variant A ---"
           pkill -f arc-debug.sqlite3 2>/dev/null || true
           sleep 1
           ps -ef 2>/dev/null | grep arc-debug.sqlite3 | grep -v grep && echo "(processes still alive after pkill — sending SIGKILL)" && pkill -9 -f arc-debug.sqlite3 2>/dev/null || true
           rm -f .arc.pid arc-debug.sqlite3 arc-debug.sqlite3-shm arc-debug.sqlite3-wal /tmp/arc-debug.stderr.log
+
+          echo
+          echo "================================================================"
+          echo "=== CONTROL: same spawn WITHOUT start_new_session=True       ==="
+          echo "================================================================"
+          python3 -c "
+          import subprocess, sys, os
+          p = subprocess.Popen(
+              [sys.executable, os.path.abspath('arc.py'),
+               '--host', '127.0.0.1', '--port', '6971',
+               '--storage', 'arc-debug2.sqlite3', '--quiet'],
+              stdout=subprocess.DEVNULL,
+              stderr=open('/tmp/arc-debug2.stderr.log', 'w'),
+              # NOTE: no start_new_session=True
+          )
+          print('spawned pid', p.pid)
+          "
+
+          echo "--- waiting 10s ---"
+          sleep 10
+
+          echo "--- stderr from control child ---"
+          if [ -s /tmp/arc-debug2.stderr.log ]; then
+            cat /tmp/arc-debug2.stderr.log
+          else
+            echo "(stderr file is empty)"
+          fi
+          echo
+
+          echo "--- ps for control process ---"
+          ps -ef 2>/dev/null | grep arc-debug2.sqlite3 | grep -v grep || echo "(no control processes)"
+          echo
+
+          echo "--- lsof on port 6971 ---"
+          lsof -nP -i :6971 2>/dev/null || echo "(nothing on 6971)"
+          echo
+
+          echo "--- pidfile after control ---"
+          (cat .arc.pid 2>/dev/null && echo) || echo "(no .arc.pid)"
+          echo
+
+          echo "--- direct probe of control hub via curl ---"
+          curl -fsS http://127.0.0.1:6971/v1/hub-info 2>&1 | head -c 300 || echo "(curl failed)"
+          echo
+
+          echo "--- cleanup variant B ---"
+          pkill -f arc-debug2.sqlite3 2>/dev/null || true
+          sleep 1
+          pkill -9 -f arc-debug2.sqlite3 2>/dev/null || true
+          rm -f .arc.pid arc-debug2.sqlite3 arc-debug2.sqlite3-shm arc-debug2.sqlite3-wal /tmp/arc-debug2.stderr.log
           echo "diagnostic step done"
 
       - name: Arc CLI smoke — start, post, poll, stop
