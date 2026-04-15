@@ -60,177 +60,24 @@ jobs:
       - name: Run test suite
         run: python -m unittest discover -s tests -v
 
-      # ----- macOS-only diagnostic for the arc ensure failure mode -----
-      # This step exists ONLY to capture stderr from a manually-spawned
-      # hub child the same way arc ensure spawns it. arc ensure pipes
-      # stderr to DEVNULL by design, so on the failing macOS runner we
-      # have no visibility into what the child is actually doing.
-      # continue-on-error: true means this NEVER gates the job — it is
-      # pure data collection. Remove this step once the bug is fixed.
-      - name: Diagnose arc ensure failure mode (macOS only)
-        if: matrix.os == 'macos-latest'
-        continue-on-error: true
+      - name: Arc CLI smoke — arc ensure, post, poll, stop
         shell: bash
         run: |
-          set +e
-          echo "=== environment ==="
-          which python3
-          python3 -c "import sys; print('sys.executable =', sys.executable); print('sys.version =', sys.version)"
-          uname -a
-          arch
-          echo
-
-          rm -f .arc.pid arc-debug.sqlite3 arc-debug.sqlite3-shm arc-debug.sqlite3-wal /tmp/arc-debug.stderr.log
-
-          echo "=== spawning hub child manually with stderr captured ==="
-          python3 -c "
-          import subprocess, sys, os
-          p = subprocess.Popen(
-              [sys.executable, os.path.abspath('arc.py'),
-               '--host', '127.0.0.1', '--port', '6970',
-               '--storage', 'arc-debug.sqlite3', '--quiet'],
-              stdout=subprocess.DEVNULL,
-              stderr=open('/tmp/arc-debug.stderr.log', 'w'),
-              start_new_session=True,
-          )
-          print('spawned pid', p.pid)
-          "
-
-          echo "--- waiting 10s for child to either bind or fail ---"
-          sleep 10
-
-          echo "--- stderr from child ---"
-          if [ -s /tmp/arc-debug.stderr.log ]; then
-            cat /tmp/arc-debug.stderr.log
-          else
-            echo "(stderr file is empty — no traceback, child either hung silently or wrote nothing)"
-          fi
-          echo
-
-          echo "--- ps for arc-debug processes ---"
-          ps -ef 2>/dev/null | grep arc-debug.sqlite3 | grep -v grep || echo "(no arc-debug processes)"
-          echo
-
-          echo "--- lsof on port 6970 ---"
-          lsof -nP -i :6970 2>/dev/null || echo "(nothing on 6970)"
-          echo
-
-          echo "--- pidfile ---"
-          (cat .arc.pid 2>/dev/null && echo) || echo "(no .arc.pid)"
-          echo
-
-          echo "--- cleanup variant A ---"
-          pkill -f arc-debug.sqlite3 2>/dev/null || true
-          sleep 1
-          ps -ef 2>/dev/null | grep arc-debug.sqlite3 | grep -v grep && echo "(processes still alive after pkill — sending SIGKILL)" && pkill -9 -f arc-debug.sqlite3 2>/dev/null || true
-          rm -f .arc.pid arc-debug.sqlite3 arc-debug.sqlite3-shm arc-debug.sqlite3-wal /tmp/arc-debug.stderr.log
-
-          echo
-          echo "================================================================"
-          echo "=== CONTROL: same spawn WITHOUT start_new_session=True       ==="
-          echo "================================================================"
-          python3 -c "
-          import subprocess, sys, os
-          p = subprocess.Popen(
-              [sys.executable, os.path.abspath('arc.py'),
-               '--host', '127.0.0.1', '--port', '6971',
-               '--storage', 'arc-debug2.sqlite3', '--quiet'],
-              stdout=subprocess.DEVNULL,
-              stderr=open('/tmp/arc-debug2.stderr.log', 'w'),
-              # NOTE: no start_new_session=True
-          )
-          print('spawned pid', p.pid)
-          "
-
-          echo "--- waiting 10s ---"
-          sleep 10
-
-          echo "--- stderr from control child ---"
-          if [ -s /tmp/arc-debug2.stderr.log ]; then
-            cat /tmp/arc-debug2.stderr.log
-          else
-            echo "(stderr file is empty)"
-          fi
-          echo
-
-          echo "--- ps for control process ---"
-          ps -ef 2>/dev/null | grep arc-debug2.sqlite3 | grep -v grep || echo "(no control processes)"
-          echo
-
-          echo "--- lsof on port 6971 ---"
-          lsof -nP -i :6971 2>/dev/null || echo "(nothing on 6971)"
-          echo
-
-          echo "--- pidfile after control ---"
-          (cat .arc.pid 2>/dev/null && echo) || echo "(no .arc.pid)"
-          echo
-
-          echo "--- direct probe of control hub via curl ---"
-          curl -fsS http://127.0.0.1:6971/v1/hub-info 2>&1 | head -c 300 || echo "(curl failed)"
-          echo
-
-          echo "--- cleanup variant B ---"
-          pkill -f arc-debug2.sqlite3 2>/dev/null || true
-          sleep 1
-          pkill -9 -f arc-debug2.sqlite3 2>/dev/null || true
-          rm -f .arc.pid arc-debug2.sqlite3 arc-debug2.sqlite3-shm arc-debug2.sqlite3-wal /tmp/arc-debug2.stderr.log
-          echo "diagnostic step done"
-
-      - name: Arc CLI smoke — start, post, poll, stop
-        shell: bash
-        run: |
-          # We deliberately do NOT use `arc ensure` here. `arc ensure`
-          # uses subprocess.Popen with stderr=DEVNULL and
-          # start_new_session=True, which on macOS framework Python can
-          # silently hang or detach the hub child without surfacing any
-          # error. Starting the hub in the foreground with `&` keeps
-          # stderr attached to the CI log, so any startup error is
-          # visible immediately.
-
           # Belt-and-braces cleanup in case the unit tests (which ran in
           # the previous step) leaked a stale .arc.pid or sqlite WAL.
+          # Tests use ephemeral ports, but they do call runtime.start()
+          # which writes a pidfile.
           rm -f .arc.pid arc.sqlite3 arc.sqlite3-shm arc.sqlite3-wal
 
-          # Start the hub in the background. stderr inherits the CI
-          # log so any traceback from the hub appears in this step.
-          arc --port 6969 --storage arc.sqlite3 --quiet &
-          HUB_PID=$!
-          echo "spawned hub pid=$HUB_PID"
-
-          # Poll for readiness up to 30 seconds, but bail early if the
-          # process dies — that gives a concrete error instead of a
-          # generic timeout.
-          ready=0
-          for i in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:6969/v1/hub-info >/dev/null 2>&1; then
-              echo "hub responsive after ${i}s"
-              ready=1
-              break
-            fi
-            if ! kill -0 $HUB_PID 2>/dev/null; then
-              echo "hub pid $HUB_PID died after ${i}s — see stderr above"
-              wait $HUB_PID 2>/dev/null
-              exit 1
-            fi
-            sleep 1
-          done
-
-          if [ $ready -ne 1 ]; then
-            echo "=== hub still not responsive after 30s; diagnostics ==="
-            ps -p $HUB_PID -o pid,ppid,stat,etime,command || true
-            (lsof -nP -i :6969 2>/dev/null \
-              || netstat -an 2>/dev/null | grep 6969) || echo "(nothing on 6969)"
-            kill -9 $HUB_PID 2>/dev/null || true
-            exit 1
-          fi
-
-          arc post --agent ci-smoke --base-url http://127.0.0.1:6969 "hello from CI on ${{ matrix.os }}"
-          arc poll --agent ci-smoke --base-url http://127.0.0.1:6969 --timeout 3 --include-self
-
-          # Clean shutdown, then wait for the process to exit so its
-          # final stderr (if any) makes it into the log.
-          kill $HUB_PID 2>/dev/null || true
-          wait $HUB_PID 2>/dev/null || true
+          # arc.py's default ensure timeout is now 60s, which is enough
+          # for cold-start environments like fresh GHA macos runners
+          # (Gatekeeper + ephemeral disk can push the spawned child's
+          # first cold import past 30s). Linux and Windows runners
+          # still complete in ~1s.
+          arc ensure
+          arc post --agent ci-smoke "hello from CI on ${{ matrix.os }}"
+          arc poll --agent ci-smoke --timeout 3 --include-self
+          arc stop
 
       - name: Version sync — arc.py __version__ matches package.json version
         shell: python

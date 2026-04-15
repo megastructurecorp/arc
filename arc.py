@@ -1515,18 +1515,28 @@ def reset_hub(storage="arc.sqlite3", host="127.0.0.1", port=6969):
     return {"reset": True, "removed": removed}
 
 
-def ensure_hub(host="127.0.0.1", port=6969, storage="arc.sqlite3", timeout=5.0, spool_dir=DEFAULT_SPOOL_DIR,
+def ensure_hub(host="127.0.0.1", port=6969, storage="arc.sqlite3", timeout=60.0, spool_dir=DEFAULT_SPOOL_DIR,
                max_body_chars=128_000, max_attachment_chars=256_000, max_attachments=32, allow_remote=False):
     """Check if a hub is running; if not, start one in the background.
-    Returns dict with: running (bool), started (bool), url (str).
-    The port binding itself is the mutex — only one process can bind."""
+    Returns dict with: running (bool), started (bool), url (str), and on
+    failure an "error" string. The port binding itself is the mutex —
+    only one process can bind.
+
+    The default timeout (60s) is generous so that cold-start environments
+    like fresh CI runners on macOS — where Gatekeeper code-signing checks
+    of the spawned Python interpreter can take 30s+ on first execution —
+    are not falsely reported as failures. Fast environments are not
+    penalized: the readiness loop returns as soon as _probe_hub succeeds,
+    and the timeout is only the upper bound on how long the parent will
+    wait. Override with the --timeout CLI flag if you want shorter.
+    """
     import subprocess, sys
     base = _pidfile_url(host, port)
     pid_info = _discover_pidfile(storage)
     if pid_info and _probe_hub(pid_info["url"]): return {"running": True, "started": False, "url": pid_info["url"]}
     if _probe_hub(base): return {"running": True, "started": False, "url": base}
     try:
-        subprocess.Popen([sys.executable, __file__, "--host", host, "--port", str(port),
+        proc = subprocess.Popen([sys.executable, __file__, "--host", host, "--port", str(port),
             "--storage", storage, "--spool-dir", spool_dir,
             "--max-body-chars", str(max_body_chars),
             "--max-attachment-chars", str(max_attachment_chars),
@@ -1538,6 +1548,13 @@ def ensure_hub(host="127.0.0.1", port=6969, storage="arc.sqlite3", timeout=5.0, 
     while time.monotonic() < deadline:
         time.sleep(0.15)
         if _probe_hub(base): return {"running": True, "started": True, "url": base}
+        # Detect child death so a crashing spawn returns immediately
+        # instead of waiting the full timeout. proc.poll() is None
+        # while the child is alive; otherwise it's the exit code.
+        rc = proc.poll()
+        if rc is not None:
+            return {"running": False, "started": True, "url": base,
+                    "error": f"child exited rc={rc} (stderr is suppressed by ensure; run `arc --port {port} --storage {storage}` in the foreground to see the real error)"}
     return {"running": False, "started": True, "url": base, "error": "timeout"}
 
 
@@ -2732,7 +2749,7 @@ def main():
     ens.add_argument("--port", type=int, default=6969)
     ens.add_argument("--storage", default="arc.sqlite3")
     ens.add_argument("--spool-dir", default=DEFAULT_SPOOL_DIR)
-    ens.add_argument("--timeout", type=float, default=5.0)
+    ens.add_argument("--timeout", type=float, default=60.0)
     ens.add_argument("--allow-remote", action="store_true")
     ens.add_argument("--max-body-chars", type=int, default=128_000, help="Maximum characters in a message body")
     ens.add_argument("--max-attachment-chars", type=int, default=256_000, help="Maximum characters per attachment (JSON-encoded)")
