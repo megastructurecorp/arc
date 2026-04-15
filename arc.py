@@ -1007,8 +1007,24 @@ class _H(BaseHTTPRequestHandler):
             "features":HUB_FEATURES,
             "message_kinds":sorted(MSG_KINDS)}}
     def _h_network_toggle(self, p, m, q, b):
-        if b and "allow_remote" in b: self.server.cfg.allow_remote = bool(b["allow_remote"])
-        return {"ok":True,"result":{"allow_remote":self.server.cfg.allow_remote}}
+        # The listening socket is bound once at startup (see _Srv.__init__) and
+        # this handler cannot rebind it. Flipping `allow_remote` to true while
+        # the hub is bound to loopback would silently mislead the operator —
+        # the dashboard would say "remote access ON" but no LAN client could
+        # ever connect. Reject that case loudly and tell the operator how to
+        # actually expose the hub.
+        if b and "allow_remote" in b:
+            want = bool(b["allow_remote"])
+            if want and self.server.cfg.listen_host in LOCAL_BIND_HOSTS:
+                raise ValueError(
+                    f"cannot enable remote access at runtime: hub is bound to "
+                    f"{self.server.cfg.listen_host} and the listening socket "
+                    "cannot be rebound. Restart the hub with "
+                    "`--host 0.0.0.0 --allow-remote` to expose it on the LAN."
+                )
+            self.server.cfg.allow_remote = want
+        return {"ok":True,"result":{"allow_remote":self.server.cfg.allow_remote,
+            "listen_host":self.server.cfg.listen_host}}
     def _h_events(self, p, m, q, b):
         s = self.server.store; cfg = self.server.cfg
         aid = q.get("agent_id",[None])[0]; ch = q.get("channel",[None])[0]; tid = q.get("thread_id",[None])[0]

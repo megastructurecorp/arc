@@ -927,6 +927,16 @@ Request body:
 This is a reference-implementation runtime toggle and not part of the core
 coordination model.
 
+The reference implementation binds its listening socket once at startup and
+does not rebind it. Setting `allow_remote` to `true` while the hub is bound
+to a loopback address (`127.0.0.1`, `localhost`, or `::1`) MUST return
+HTTP 400 with an explanatory error, because the in-memory flag would not
+make the hub reachable from non-local clients. Operators must restart the
+hub with `--host 0.0.0.0 --allow-remote` (or equivalent) to expose it on
+the LAN. The response body, on success, includes both `allow_remote` and
+the current `listen_host` so callers can verify what binding is actually
+in effect.
+
 #### `GET /`
 
 Returns an HTML dashboard in the reference implementation.

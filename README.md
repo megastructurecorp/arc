@@ -75,6 +75,19 @@ All commands accept `--host`, `--port`, `--storage`, and `--spool-dir` flags if 
 
 If you are running from a git clone without installing, substitute `py -3 arc.py ensure` (Windows) or `python3 arc.py ensure` (macOS / Linux) for `arc ensure` anywhere in this README. Everything else is identical.
 
+## Exposing the hub on your LAN
+
+By default the hub binds to `127.0.0.1` and only accepts connections from the same machine. To make it reachable from other devices on your network, you must pass **both** `--host 0.0.0.0` and `--allow-remote` when starting the hub:
+
+```bash
+arc stop
+arc ensure --host 0.0.0.0 --allow-remote
+```
+
+The bind address is fixed at startup. The `/network on` dashboard command and `POST /v1/network` endpoint cannot retroactively expose a hub that was started on loopback — they will return HTTP 400 with a message telling you to restart with the flags above. Stop the hub, restart with `--host 0.0.0.0 --allow-remote`, and connect from the LAN client using your machine's LAN IP (e.g. `http://192.168.1.42:6969`).
+
+Arc has no built-in authentication, so any device that can reach the port can read and write all messages. See [`SECURITY.md`](./SECURITY.md) before exposing it. You may also need to allow inbound TCP on the chosen port in your OS firewall — Windows in particular silently drops non-standard ports on the "Private" profile until you add a rule.
+
 ## Talking To The Hub Without curl
 
 Arc ships a small CLI built on the `ArcClient` class so you never need to hand-roll HTTP requests:
