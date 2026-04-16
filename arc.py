@@ -1793,6 +1793,7 @@ class ArcClient:
         self.timeout = timeout
         self._transport = transport if transport is not None else _HTTPTransport(self.base_url, timeout)
         self._since_id = 0
+        self.session_id: str | None = None
 
     @classmethod
     def over_relay(cls, agent_id: str, spool_dir: str = DEFAULT_SPOOL_DIR, *, timeout: float = 30.0) -> "ArcClient":
@@ -1813,7 +1814,37 @@ class ArcClient:
         if display_name is not None: body["display_name"] = display_name
         if capabilities is not None: body["capabilities"] = list(capabilities)
         if metadata is not None: body["metadata"] = dict(metadata)
-        return self._call("POST", "/v1/sessions", body)["result"]
+        result = self._call("POST", "/v1/sessions", body)["result"]
+        self.session_id = result.get("session_id")
+        return result
+
+    def create_channel(self, name: str, *, metadata: dict | None = None) -> dict:
+        """Create a channel if it does not already exist. Idempotent — the hub
+        returns the existing channel row if one is already present under the
+        same name. `created_by` is set to this client's agent_id."""
+        body: dict[str, Any] = {"name": name, "created_by": self.agent_id}
+        if metadata is not None: body["metadata"] = metadata
+        return self._call("POST", "/v1/channels", body)["result"]
+
+    def close(self) -> None:
+        """Deregister this session from the hub. Safe to call multiple times.
+        Errors (hub down, session already gone, transport broken) are swallowed
+        so this is usable in `finally` blocks and `__exit__`. If you need the
+        raw error, call `_call("DELETE", f"/v1/sessions/{self.session_id}")`
+        directly instead."""
+        sid = self.session_id
+        if not sid: return
+        self.session_id = None
+        try:
+            self._call("DELETE", f"/v1/sessions/{sid}")
+        except Exception:
+            pass  # best-effort; hub may already be stopped
+
+    def __enter__(self) -> "ArcClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
     def post(self, channel: str, body: str, *, kind: str = "chat", thread_id: str | None = None,
              to_agent: str | None = None, attachments: list | None = None,
@@ -1885,24 +1916,45 @@ class ArcClient:
     def quickstart(cls, agent_id: str, base_url: str = DEFAULT_BASE_URL, *,
                    display_name: str | None = None, capabilities: list[str] | None = None,
                    timeout: float = 15.0) -> "ArcClient":
-        """Construct, register, and return a ready-to-use client in one call."""
+        """Construct, register, bootstrap, and return a ready-to-use client in one call.
+
+        Calls bootstrap() after register() to advance _since_id to the
+        hub's current high-watermark.  Without this, the first poll()
+        returns every historical message (since_id=0), which causes
+        freshly-started agents to replay stale task_requests, react to
+        old shutdown keywords, and generally hallucinate about work that
+        finished hours ago.
+        """
         c = cls(agent_id, base_url=base_url, timeout=timeout)
         c.register(display_name=display_name or agent_id, replace=True, capabilities=capabilities)
+        c.bootstrap()
         return c
 
     def call(self, to_agent: str, body: str, *, channel: str = "direct",
              timeout: float = 30.0, poll_interval: float = 1.0,
              metadata: dict | None = None) -> dict:
         """Synchronous agent-to-agent RPC. Posts a task_request, polls for the
-        matching task_result (via reply_to), returns the result message or raises on timeout."""
+        matching task_result (via reply_to), returns the result message or raises on timeout.
+
+        Scans both the public channel view AND this agent's inbox so the
+        response is found regardless of whether the specialist set
+        to_agent on the task_result.  The hub filters DMs out of
+        ``GET /v1/messages?channel=`` results, so a channel-only scan
+        would miss task_results that were accidentally (or deliberately)
+        posted as DMs addressed to the caller.
+        """
         req = self.post(channel, body, kind="task_request", to_agent=to_agent, metadata=metadata)
         req_id = req["id"]
         scan_since = max(0, req_id - 1)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            path = f"/v1/messages?channel={urllib.parse.quote(channel)}&since_id={scan_since}&limit=200"
-            msgs = self._call("GET", path)["result"]
-            for m in msgs:
+            # Public channel messages (to_agent IS NULL).
+            ch_path = f"/v1/messages?channel={urllib.parse.quote(channel)}&since_id={scan_since}&limit=200"
+            ch_msgs = self._call("GET", ch_path)["result"]
+            # Also check our inbox for DM'd task_results.
+            inbox_path = f"/v1/inbox/{urllib.parse.quote(self.agent_id)}?since_id={scan_since}&limit=200"
+            inbox_msgs = self._call("GET", inbox_path)["result"]
+            for m in ch_msgs + inbox_msgs:
                 if m.get("kind") == "task_result" and m.get("reply_to") == req_id:
                     return m
             time.sleep(poll_interval)
