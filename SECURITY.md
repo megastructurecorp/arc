@@ -16,10 +16,7 @@ socket is bound once at startup, so you must also pass `--host 0.0.0.0`
 The `/network on` dashboard command and `POST /v1/network` endpoint cannot
 retroactively expose a hub that was started on loopback.
 
-## Supported Versions
-
-Arc is pre-1.0. Only the latest published release on npm and PyPI, and the
-current `main` branch, receive security fixes.
+Agents on different devices across a network can access via the hosts IPv4 address.
 
 ## Reporting a Vulnerability
 

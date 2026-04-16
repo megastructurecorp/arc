@@ -31,6 +31,10 @@ Run:
 arc whoami --agent <your_id>
 ```
 
+This is a **stateful** self-test, not a read-only probe: the CLI registers
+`<your_id>` with `replace=true` before it calls bootstrap. Use the exact id
+you intend to own for this session; do not "probe" with a teammate's id.
+
 If `arc` is not on your `PATH`, use one of:
 
 ```
@@ -304,13 +308,15 @@ When your task is done:
 
 ## 11. Per-harness onboarding
 
-Each harness — Claude Code, Cursor, Gemini CLI, Codex CLI, Claude Cowork, a
-generic MCP host — has its own shell conventions, prompt style, and sandbox
-shape. The operator should paste the relevant harness-specific document from
-[`docs/harnesses/`](harnesses/) into your context alongside this one:
+Each harness — Claude Code, Cursor, Gemini CLI, Codex Desktop, Codex CLI,
+Claude Cowork, a generic MCP host — has its own shell conventions, prompt
+style, and sandbox shape. The operator should paste the relevant
+harness-specific document from [`docs/harnesses/`](harnesses/) into your
+context alongside this one:
 
 - [`harnesses/claude-code.md`](harnesses/claude-code.md)
 - [`harnesses/claude-cowork.md`](harnesses/claude-cowork.md) — relay transport
+- [`harnesses/codex-desktop.md`](harnesses/codex-desktop.md)
 - [`harnesses/cursor.md`](harnesses/cursor.md) — Cursor / Composer
 - [`harnesses/gemini-cli.md`](harnesses/gemini-cli.md)
 - [`harnesses/codex-cli.md`](harnesses/codex-cli.md)

@@ -390,15 +390,33 @@ class HubStore:
             r = self._db.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()
         return self._mg(r) if r else None
 
-    def list_channel_messages(self, ch, since_id=0, limit=100):
+    def list_channel_messages(self, ch, since_id=0, limit=100, *, tail=False):
         with self._lk:
-            return [self._mg(r) for r in self._db.execute(
-                "SELECT * FROM messages WHERE channel=? AND to_agent IS NULL AND id>? ORDER BY id LIMIT ?", (ch, since_id, limit)).fetchall()]
+            if tail and since_id <= 0:
+                rows = self._db.execute(
+                    "SELECT * FROM (SELECT * FROM messages WHERE channel=? AND to_agent IS NULL ORDER BY id DESC LIMIT ?) ORDER BY id",
+                    (ch, limit),
+                ).fetchall()
+            else:
+                rows = self._db.execute(
+                    "SELECT * FROM messages WHERE channel=? AND to_agent IS NULL AND id>? ORDER BY id LIMIT ?",
+                    (ch, since_id, limit),
+                ).fetchall()
+        return [self._mg(r) for r in rows]
 
-    def list_inbox_messages(self, agent_id, since_id=0, limit=100):
+    def list_inbox_messages(self, agent_id, since_id=0, limit=100, *, tail=False):
         with self._lk:
-            return [self._mg(r) for r in self._db.execute(
-                "SELECT * FROM messages WHERE to_agent=? AND id>? ORDER BY id LIMIT ?", (agent_id, since_id, limit)).fetchall()]
+            if tail and since_id <= 0:
+                rows = self._db.execute(
+                    "SELECT * FROM (SELECT * FROM messages WHERE to_agent=? ORDER BY id DESC LIMIT ?) ORDER BY id",
+                    (agent_id, limit),
+                ).fetchall()
+            else:
+                rows = self._db.execute(
+                    "SELECT * FROM messages WHERE to_agent=? AND id>? ORDER BY id LIMIT ?",
+                    (agent_id, since_id, limit),
+                ).fetchall()
+        return [self._mg(r) for r in rows]
 
     def list_visible_messages_for_agent(self, agent_id, since_id=0, limit=500, *, channel=None, thread_id=None, exclude_self=False):
         conds = ["id>?", "(to_agent IS NULL OR to_agent=?)"]
@@ -420,20 +438,32 @@ class HubStore:
             ).fetchall()
         return [self._mg(r) for r in rows]
 
-    def list_thread_messages(self, tid, channel=None, since_id=0, limit=100, *, include_direct=False):
+    def list_thread_messages(self, tid, channel=None, since_id=0, limit=100, *, include_direct=False, tail=False):
         with self._lk:
             if channel:
                 vis = "" if include_direct else "AND to_agent IS NULL"
-                rows = self._db.execute(
-                    f"SELECT * FROM messages WHERE thread_id=? AND channel=? {vis} AND id>? ORDER BY id LIMIT ?",
-                    (tid, channel, since_id, limit),
-                ).fetchall()
+                if tail and since_id <= 0:
+                    rows = self._db.execute(
+                        f"SELECT * FROM (SELECT * FROM messages WHERE thread_id=? AND channel=? {vis} ORDER BY id DESC LIMIT ?) ORDER BY id",
+                        (tid, channel, limit),
+                    ).fetchall()
+                else:
+                    rows = self._db.execute(
+                        f"SELECT * FROM messages WHERE thread_id=? AND channel=? {vis} AND id>? ORDER BY id LIMIT ?",
+                        (tid, channel, since_id, limit),
+                    ).fetchall()
             else:
                 vis = "" if include_direct else "AND to_agent IS NULL"
-                rows = self._db.execute(
-                    f"SELECT * FROM messages WHERE thread_id=? {vis} AND id>? ORDER BY id LIMIT ?",
-                    (tid, since_id, limit),
-                ).fetchall()
+                if tail and since_id <= 0:
+                    rows = self._db.execute(
+                        f"SELECT * FROM (SELECT * FROM messages WHERE thread_id=? {vis} ORDER BY id DESC LIMIT ?) ORDER BY id",
+                        (tid, limit),
+                    ).fetchall()
+                else:
+                    rows = self._db.execute(
+                        f"SELECT * FROM messages WHERE thread_id=? {vis} AND id>? ORDER BY id LIMIT ?",
+                        (tid, since_id, limit),
+                    ).fetchall()
         return [self._mg(r) for r in rows]
 
     def list_all_thread_messages(self, tid):
@@ -1088,14 +1118,16 @@ class _H(BaseHTTPRequestHandler):
         if not ch and not tid: raise ValueError("channel or thread_id query parameter is required")
         if ch and s.get_channel(ch) is None: raise _NotFound("channel not found")
         si = _parse_since_id(q); li = _parse_limit(q, cfg.max_query_limit); to = _parse_timeout(q)
-        return {"ok":True,"result":_poll_until(lambda: s.list_thread_messages(tid,channel=ch,since_id=si,limit=li) if tid else s.list_channel_messages(ch,since_id=si,limit=li), to)}
+        tail = q.get("tail",[""])[0].lower() in ("true","1","yes")
+        return {"ok":True,"result":_poll_until(lambda: s.list_thread_messages(tid,channel=ch,since_id=si,limit=li,tail=tail) if tid else s.list_channel_messages(ch,since_id=si,limit=li,tail=tail), to)}
     def _h_thread(self, p, m, q, b):
         d = self.server.store.get_thread_detail(m.group("id"))
         if d is None: raise _NotFound("thread not found")
         return {"ok":True,"result":d}
     def _h_inbox(self, p, m, q, b):
         si = _parse_since_id(q); li = _parse_limit(q, self.server.cfg.max_query_limit)
-        return {"ok":True,"result":self.server.store.list_inbox_messages(m.group("id"),since_id=si,limit=li)}
+        tail = q.get("tail",[""])[0].lower() in ("true","1","yes")
+        return {"ok":True,"result":self.server.store.list_inbox_messages(m.group("id"),since_id=si,limit=li,tail=tail)}
     def _h_list_claims(self, p, m, q, b):
         ao = q.get("active_only",[""])[0].lower() in ("true","1","yes")
         return {"ok":True,"result":self.server.store.list_claims(thread_id=q.get("thread_id",[None])[0],active_only=ao)}
@@ -2294,6 +2326,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,monospace;
 .agent-pill .dot{width:6px;height:6px}
 #feed{flex:1;overflow-y:auto;padding:.75rem 1rem;display:flex;flex-direction:column;gap:.15rem}
 .msg{font-size:.82rem;line-height:1.5;word-wrap:break-word}
+.msg-attachments{display:block;margin-left:4.6rem;white-space:pre-wrap;color:#94a3b8}
+.msg-attachment{display:block}
+.msg-attachment-label{color:#64748b;font-size:.74rem;margin-right:.35rem}
 .msg-time{color:#475569;margin-right:.4rem;font-size:.75rem}
 .msg-from{font-weight:600;margin-right:.3rem}
 .msg-self .msg-from{color:#38bdf8}
@@ -2419,6 +2454,41 @@ function nickColor(name){
   return NICK_COLORS[Math.abs(h)%NICK_COLORS.length];
 }
 
+function attachmentContent(att){
+  if(!att||!Object.prototype.hasOwnProperty.call(att,'content')) return '';
+  if(typeof att.content==='string') return esc(att.content);
+  try{return esc(JSON.stringify(att.content));}catch(e){return esc(String(att.content));}
+}
+
+function attachmentSummary(att){
+  if(!att||typeof att!=='object') return '<div class="msg-attachment"><span class="msg-attachment-label">attachment</span></div>';
+  if(att.type==='text') return '<div class="msg-attachment"><span class="msg-attachment-label">text</span>'+attachmentContent(att)+'</div>';
+  if(att.type==='json') return '<div class="msg-attachment"><span class="msg-attachment-label">json</span>'+attachmentContent(att)+'</div>';
+  if(att.type==='code'){
+    const lang=att.language?' ['+esc(att.language)+']':'';
+    return '<div class="msg-attachment"><span class="msg-attachment-label">code'+lang+'</span>'+attachmentContent(att)+'</div>';
+  }
+  if(att.type==='file_ref'){
+    const desc=att.description?' - '+esc(att.description):'';
+    const lines=att.start_line!=null&&att.end_line!=null?' ('+esc(att.start_line)+'-'+esc(att.end_line)+')':'';
+    return '<div class="msg-attachment"><span class="msg-attachment-label">file</span>'+esc(att.path||'')+lines+desc+'</div>';
+  }
+  if(att.type==='diff_ref'){
+    const base=att.base?' '+esc(att.base):'';
+    const head=att.head?' -> '+esc(att.head):'';
+    return '<div class="msg-attachment"><span class="msg-attachment-label">diff</span>'+esc(att.path||'')+base+head+'</div>';
+  }
+  return '<div class="msg-attachment"><span class="msg-attachment-label">'+esc(att.type||'attachment')+'</span></div>';
+}
+
+function renderMessageBody(m){
+  const body=m&&m.body?esc(m.body):'';
+  const atts=Array.isArray(m&&m.attachments)?m.attachments:[];
+  if(!atts.length) return body;
+  const rendered='<div class="msg-attachments">'+atts.map(attachmentSummary).join('')+'</div>';
+  return body ? body+rendered : rendered;
+}
+
 function shouldAutoScroll(){
   const f=$('feed');return f.scrollTop+f.clientHeight>=f.scrollHeight-60;
 }
@@ -2442,7 +2512,7 @@ function appendMessages(msgs){
     const color=isMe?'#38bdf8':isSys?'#64748b':nickColor(m.from_agent);
     div.innerHTML='<span class="msg-time">'+timeFmt(m.ts)+'</span>'
       +'<span class="msg-from" style="color:'+color+'">'+esc(displayNameFor(m.from_agent))+'</span>'
-      +kindBadge+esc(m.body);
+      +kindBadge+renderMessageBody(m);
     f.appendChild(div);
     if(m.id>lastId)lastId=m.id;
   }
@@ -2462,7 +2532,8 @@ function pollUrl(){
   const base=currentThread
     ?'/v1/messages?thread_id='+encodeURIComponent(currentThread)
     :'/v1/messages?channel='+encodeURIComponent(currentChannel);
-  return seeded ? base+'&since_id='+lastId : base+'&limit=50';
+  // Seed from the newest rows so the dashboard opens on the current conversation.
+  return seeded ? base+'&since_id='+lastId : base+'&limit=50&tail=1';
 }
 
 async function pollMessages(){
@@ -2660,7 +2731,7 @@ function renderInbox(msgs){
     const color=nickColor(m.from_agent);
     div.innerHTML='<span class="msg-time">'+timeFmt(m.ts)+'</span>'
       +'<span class="msg-from" style="color:'+color+'">'+esc(displayNameFor(m.from_agent))+' &rarr; you</span>'
-      +esc(m.body);
+      +renderMessageBody(m);
     box.appendChild(div);
     if(m.id>inboxLastId)inboxLastId=m.id;
   }
@@ -2668,7 +2739,8 @@ function renderInbox(msgs){
 }
 async function pollInbox(){
   try{
-    const r=await fetch('/v1/inbox/'+encodeURIComponent(currentAgent)+'?since_id='+inboxLastId);
+    const q=inboxLastId?'?since_id='+inboxLastId:'?limit=50&tail=1';
+    const r=await fetch('/v1/inbox/'+encodeURIComponent(currentAgent)+q);
     const j=await r.json();
     if(j.ok&&j.result.length)renderInbox(j.result);
   }catch(e){}

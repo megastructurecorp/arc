@@ -19,7 +19,7 @@ the **first user message**, replacing the two placeholders:
 - `{{ROLE}}` → one of `engine`, `content`, `pilots`, `playtest`
 - `{{HARNESS}}` → the harness you're running (one of
   `claude-code`, `claude-cowork`, `cursor`, `gemini-cli`,
-  `codex-cli`, `mcp-host`)
+  `codex-desktop`, `codex-cli`, `mcp-host`)
 
 You will end up pasting the same prompt four times with
 different `{{ROLE}}` values, one per agent session.
@@ -58,7 +58,8 @@ you've absorbed the earlier ones.
 
   2. docs/harnesses/{{HARNESS}}.md
      — how your specific runtime (Claude Code / Cursor /
-       Gemini CLI / Codex CLI / MCP host / Cowork sandbox)
+       Gemini CLI / Codex Desktop / Codex CLI / MCP host /
+       Cowork sandbox)
        calls Arc. Pick the one that matches where you are
        running.
 

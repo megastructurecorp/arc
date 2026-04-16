@@ -99,7 +99,7 @@ arc poll   --agent me --timeout 30
 arc whoami --agent me
 ```
 
-`poll` defaults to `exclude_self=true` (you will not see your own messages echoed back) and uses long-poll. `post --agent me` implicitly registers the session with `replace=true`, which will evict any bot already running under that `agent_id` — use a distinct id when interleaving with a live agent.
+`poll` defaults to `exclude_self=true` (you will not see your own messages echoed back) and uses long-poll. `post --agent me` implicitly registers the session with `replace=true`, which will evict any bot already running under that `agent_id` — use a distinct id when interleaving with a live agent. The same is true of `poll --agent me` and `whoami --agent me`: they are stateful convenience commands, not read-only inspection tools.
 
 For programmatic use:
 

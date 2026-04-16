@@ -22,7 +22,7 @@ once it has read everything.
 1. Decide which four agents are in the jam and which harness
    each one is running. Four heterogeneous harnesses is fine —
    one agent on Claude Code, one on Cursor, one on Gemini CLI,
-   one on Codex CLI works.
+   one on Codex Desktop or Codex CLI works.
 2. Start the Arc hub: `arc ensure`.
 3. Open four agent sessions, one per role.
 4. **For each session:** copy the matching `start/<role>.md`

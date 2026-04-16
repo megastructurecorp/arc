@@ -249,6 +249,116 @@ class TestPollingBehavior(unittest.TestCase):
         self.assertLess(elapsed, 22.0)
 
 
+class TestTailQueries(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.config = HubConfig(
+            listen_host="127.0.0.1",
+            port=0,
+            storage_path=os.path.join(self.tempdir.name, "arc.sqlite3"),
+            log_events=False,
+        )
+        self.server = create_server(self.config)
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.server.runtime.start()
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.runtime.stop()
+        self.server.server_close()
+        self.tempdir.cleanup()
+
+    def test_messages_tail_returns_newest_channel_rows(self):
+        ids = []
+        for idx in range(5):
+            status, resp = _req(self.base_url, "POST", "/v1/messages", {
+                "from_agent": "tail-channel",
+                "channel": "general",
+                "body": f"message {idx}",
+            })
+            self.assertEqual(status, 201, resp)
+            ids.append(resp["result"]["id"])
+
+        status, resp = _req(self.base_url, "GET", "/v1/messages?channel=general&limit=2&tail=1")
+        self.assertEqual(status, 200, resp)
+        self.assertEqual([item["id"] for item in resp["result"]], ids[-2:])
+
+    def test_messages_tail_returns_newest_thread_rows(self):
+        ids = []
+        for idx in range(5):
+            status, resp = _req(self.base_url, "POST", "/v1/messages", {
+                "from_agent": "tail-thread",
+                "channel": "general",
+                "thread_id": "thread-tail-001",
+                "body": f"thread message {idx}",
+            })
+            self.assertEqual(status, 201, resp)
+            ids.append(resp["result"]["id"])
+
+        status, resp = _req(self.base_url, "GET", "/v1/messages?thread_id=thread-tail-001&limit=2&tail=1")
+        self.assertEqual(status, 200, resp)
+        self.assertEqual([item["id"] for item in resp["result"]], ids[-2:])
+
+    def test_inbox_tail_returns_newest_direct_messages(self):
+        ids = []
+        for idx in range(5):
+            status, resp = _req(self.base_url, "POST", "/v1/messages", {
+                "from_agent": "tail-dm",
+                "to_agent": "operator",
+                "channel": "direct",
+                "body": f"dm {idx}",
+            })
+            self.assertEqual(status, 201, resp)
+            ids.append(resp["result"]["id"])
+
+        status, resp = _req(self.base_url, "GET", "/v1/inbox/operator?limit=2&tail=1")
+        self.assertEqual(status, 200, resp)
+        self.assertEqual([item["id"] for item in resp["result"]], ids[-2:])
+
+
+class TestAttachmentMessages(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.config = HubConfig(
+            listen_host="127.0.0.1",
+            port=0,
+            storage_path=os.path.join(self.tempdir.name, "arc.sqlite3"),
+            log_events=False,
+        )
+        self.server = create_server(self.config)
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.server.runtime.start()
+        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server_thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.runtime.stop()
+        self.server.server_close()
+        self.tempdir.cleanup()
+
+    def test_attachment_only_messages_roundtrip_through_api(self):
+        status, resp = _req(self.base_url, "POST", "/v1/messages", {
+            "from_agent": "attachment-agent",
+            "channel": "general",
+            "attachments": [{"type": "text", "content": "hello from attachment"}],
+        })
+        self.assertEqual(status, 201, resp)
+        self.assertEqual(resp["result"]["body"], "")
+        self.assertEqual(resp["result"]["attachments"][0]["content"], "hello from attachment")
+
+        status, resp = _req(self.base_url, "GET", "/v1/messages?channel=general&since_id=0")
+        self.assertEqual(status, 200, resp)
+        self.assertTrue(any(
+            item["from_agent"] == "attachment-agent"
+            and item["body"] == ""
+            and item["attachments"] == [{"type": "text", "content": "hello from attachment"}]
+            for item in resp["result"]
+        ))
+
+
 class TestHubInfoCapabilityNegotiation(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()

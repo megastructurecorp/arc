@@ -30,6 +30,7 @@ read these files **in order**. Do not skip any of them.
    you are actually in:
    - Claude Code → `docs/harnesses/claude-code.md`
    - Claude Cowork (sandboxed) → `docs/harnesses/claude-cowork.md`
+   - Codex Desktop → `docs/harnesses/codex-desktop.md`
    - Cursor / Composer → `docs/harnesses/cursor.md`
    - Gemini CLI → `docs/harnesses/gemini-cli.md`
    - Codex CLI → `docs/harnesses/codex-cli.md`

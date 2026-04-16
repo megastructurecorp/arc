@@ -133,11 +133,11 @@ The adapter exposes six tools via `tools/list`:
 long-polls for a `task_result` with `reply_to` pointing back at the original
 message.
 
-### 5.3 Example Claude Desktop / Claude Code Config
+### 5.3 Example MCP Host Config
 
 The shape of your `mcpServers` entry depends on how Arc is installed. All
 four variants below do the same thing: spawn the Arc MCP adapter and register
-a session with `agent_id = "claude-desktop"`.
+a session with `agent_id = "desktop-review-rod"`.
 
 **After `pip install megastructure-arc`** (the `arc` console script is on `PATH`):
 
@@ -146,7 +146,7 @@ a session with `agent_id = "claude-desktop"`.
   "mcpServers": {
     "arc": {
       "command": "arc",
-      "args": ["mcp", "--agent", "claude-desktop", "--base-url", "http://127.0.0.1:6969"]
+      "args": ["mcp", "--agent", "desktop-review-rod", "--base-url", "http://127.0.0.1:6969"]
     }
   }
 }
@@ -160,7 +160,7 @@ the package on first use; a working Python 3.10+ must also be on `PATH`):
   "mcpServers": {
     "arc": {
       "command": "npx",
-      "args": ["-y", "@megastructurecorp/arc", "mcp", "--agent", "claude-desktop", "--base-url", "http://127.0.0.1:6969"]
+      "args": ["-y", "@megastructurecorp/arc", "mcp", "--agent", "desktop-review-rod", "--base-url", "http://127.0.0.1:6969"]
     }
   }
 }
@@ -174,7 +174,7 @@ fresh Windows installs; use forward slashes in the JSON path):
   "mcpServers": {
     "arc": {
       "command": "py",
-      "args": ["-3", "C:/path/to/arc.py", "mcp", "--agent", "claude-desktop", "--base-url", "http://127.0.0.1:6969"]
+      "args": ["-3", "C:/path/to/arc.py", "mcp", "--agent", "desktop-review-rod", "--base-url", "http://127.0.0.1:6969"]
     }
   }
 }
@@ -187,7 +187,7 @@ fresh Windows installs; use forward slashes in the JSON path):
   "mcpServers": {
     "arc": {
       "command": "python3",
-      "args": ["/path/to/arc.py", "mcp", "--agent", "claude-desktop", "--base-url", "http://127.0.0.1:6969"]
+      "args": ["/path/to/arc.py", "mcp", "--agent", "desktop-review-rod", "--base-url", "http://127.0.0.1:6969"]
     }
   }
 }
@@ -198,6 +198,8 @@ command name or an `npx` package name rather than an absolute path. The
 `--base-url` in every variant points at a hub you must already be running
 locally (`arc ensure`). If the hub is not up, the MCP adapter will still
 launch, but every tool call will fail until the hub comes back.
+Pick an `--agent` value that reflects the actual host and role you want to
+see on the dashboard; `desktop-review-rod` is only an example.
 
 ### 5.4 Framing and Protocol Version
 
