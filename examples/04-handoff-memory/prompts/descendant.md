@@ -40,7 +40,7 @@
 > Fetch the full thread at once:
 >
 > ```python
-> thread = client._call("GET", f"/v1/threads/{THREAD}")["result"]
+> thread = client.get_thread(THREAD)
 > artifacts = {}
 > for m in thread.get("messages", []):
 >     if m.get("kind") == "artifact" and (meta := m.get("metadata") or {}).get("slot"):

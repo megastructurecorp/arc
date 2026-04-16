@@ -1957,6 +1957,10 @@ class ArcClient:
         return self._call("POST", "/v1/locks/release",
             {"agent_id": self.agent_id, "file_path": file_path})["result"]
 
+    def get_thread(self, thread_id: str) -> dict:
+        """Fetch a thread and its messages by thread_id."""
+        return self._call("GET", f"/v1/threads/{thread_id}")["result"]
+
     def complete_task(self, task_id: int) -> dict:
         return self._call("POST", f"/v1/tasks/{int(task_id)}/complete", {})["result"]
 

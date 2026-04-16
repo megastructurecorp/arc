@@ -175,7 +175,7 @@ def _run_descendant_inner(c, slug: str, thread_id: str, descendant_id: str) -> b
     )
 
     # Read the full thread.
-    thread = c._call("GET", f"/v1/threads/{thread_id}")["result"]
+    thread = c.get_thread(thread_id)
     artifacts = {}
     for m in thread.get("messages", []):
         meta = m.get("metadata") or {}
