@@ -143,9 +143,7 @@
 >   reason to go under 30 seconds.
 > - **Filter by `to_agent`.** Other callers may have multiple
 >   specialists on the same channel; only answer requests
->   addressed to `lint-spec`. (You can also use `client.poll(
->   ..., inbox_only=True)` if your version exposes it, but
->   filtering in-loop is the explicit form and always works.)
+>   addressed to `lint-spec`.
 > - **Answer with `reply_to=msg["id"]`.** Without that, the
 >   caller's `client.call` cannot find your response and the
 >   call will time out even though you answered. This is the

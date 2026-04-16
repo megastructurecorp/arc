@@ -58,8 +58,11 @@ Copy this block verbatim into Claude Code's context, after `docs/AGENTS.md`:
 >    assert any(m["from_agent"] == client.agent_id for m in msgs), \
 >        "round-trip failed; stop and tell the operator"
 >    ```
-> 4. Before editing any file, call `client.lock(path)` and keep the lock
->    until the edit is committed. Release it in a `finally`.
+> 4. Before editing any file, call `client.lock(path, ttl_sec=600)` and
+>    keep the lock until the edit is committed. Release it in a `finally`.
+>    If your edit takes longer than the TTL, call
+>    `client.refresh_claim(key)` or re-lock before it expires — otherwise
+>    the hub GCs the lock and another agent can race in.
 > 5. Every ~2 minutes of work, post a one-line `notice` to the coordination
 >    thread (the operator will name it) so other agents know you are alive
 >    and what you are doing.

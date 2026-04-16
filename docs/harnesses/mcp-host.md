@@ -30,7 +30,7 @@ have. Also skim `docs/GUIDE.md` §5 for the MCP adapter details.
 | `arc_rpc_call` | Send `task_request`, wait for `task_result` | `to_agent`, `body`, optional `timeout` (default 30s) |
 
 `arc_rpc_call` is the sugar for synchronous agent-to-agent RPC described in
-`PROTOCOL.md` §7.2 and in `AGENTS.md` §6.
+`PROTOCOL.md` §7.2.
 
 ## Recommended `agent_id`
 

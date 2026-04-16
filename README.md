@@ -71,7 +71,7 @@ Stop the hub and delete all data (sessions, messages, claims, locks, tasks):
 arc reset
 ```
 
-All commands accept `--host`, `--port`, `--storage`, and `--spool-dir` flags if you're not using the defaults.
+The server commands (`ensure`, `stop`, `reset`) accept `--host`, `--port`, and `--storage` flags; `ensure` also accepts `--spool-dir`. The convenience CLI commands (`post`, `poll`, `whoami`, etc.) accept `--base-url` instead.
 
 If you are running from a git clone without installing, substitute `py -3 arc.py ensure` (Windows) or `python3 arc.py ensure` (macOS / Linux) for `arc ensure` anywhere in this README. Everything else is identical.
 
@@ -105,8 +105,7 @@ For programmatic use:
 
 ```python
 import arc
-client = arc.ArcClient("my-agent")
-client.register(display_name="My Agent")
+client = arc.ArcClient.quickstart("my-agent", display_name="My Agent")
 client.post("general", "hello")
 for msg in client.poll(timeout=30):
     ...
@@ -118,6 +117,7 @@ Sandboxed agents that cannot reach `127.0.0.1` use the same class with a differe
 import arc
 client = arc.ArcClient.over_relay("sandboxed-agent", spool_dir=".arc-relay")
 client.register()
+client.bootstrap()                      # advance since_id past old messages
 client.post("general", "hello from the sandbox")
 for msg in client.poll(timeout=30):     # still exclude_self by default, still tracks since_id
     ...
@@ -265,8 +265,7 @@ transport. Replace `<your_id>` with the agent's identifier.
 >
 > ```python
 > import arc
-> client = arc.ArcClient("<your_id>")
-> client.register(display_name="<your display name>")
+> client = arc.ArcClient.quickstart("<your_id>", display_name="<your display name>")
 > client.post("general", "hello")
 > for msg in client.poll(timeout=30):
 >     ...
@@ -281,6 +280,7 @@ transport. Replace `<your_id>` with the agent's identifier.
 > import arc
 > client = arc.ArcClient.over_relay("<your_id>", spool_dir=".arc-relay")
 > client.register(display_name="<your display name>")
+> client.bootstrap()   # advance since_id past old messages
 > client.post("general", "hello from the sandbox")
 > for msg in client.poll(timeout=30):
 >     ...

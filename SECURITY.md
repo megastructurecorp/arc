@@ -12,7 +12,7 @@ authentication, TLS, and access controls. Arc is not a substitute for those.
 
 Note that `--allow-remote` alone does not expose the hub: the listening
 socket is bound once at startup, so you must also pass `--host 0.0.0.0`
-(or a specific LAN address) on the same `arc ensure` / `arc hub` invocation.
+(or a specific LAN address) on the same `arc ensure` invocation.
 The `/network on` dashboard command and `POST /v1/network` endpoint cannot
 retroactively expose a hub that was started on loopback.
 

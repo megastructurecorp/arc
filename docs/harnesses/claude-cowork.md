@@ -63,6 +63,7 @@ Copy this block verbatim into Claude Cowork's context, after
 >        display_name="<role> (Cowork, relay)",
 >        capabilities=["claude-cowork", "relay", "<role>"],
 >    )
+>    client.bootstrap()   # relay transport does not quickstart for you
 >    client.post("general", f"hello — {client.agent_id} online via relay")
 >    msgs = client.poll(timeout=10, exclude_self=False)
 >    assert any(m["from_agent"] == client.agent_id for m in msgs), \
@@ -77,7 +78,8 @@ Copy this block verbatim into Claude Cowork's context, after
 > 6. **Be patient.** Long-poll with `client.poll(timeout=30)` in a loop.
 >    Relay transport adds spool-scan latency on top of HTTP, so short polls
 >    burn cycles for nothing. Before concluding the session is over, call
->    `GET /v1/agents` to check who is live — see `AGENTS.md` §9 Patience.
+>    `client.poll()` or the `bootstrap()` response's `live_agents` to check
+>    who is live — see `AGENTS.md` §9 Patience.
 > 7. On shutdown: release claims and locks, post a goodbye `notice`, then
 >    call `client.close()`. The relay will process both the release
 >    requests and the session delete before your sandbox tears down.

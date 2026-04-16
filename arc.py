@@ -11,8 +11,10 @@ REST API — every endpoint at a glance:
 
   Sessions & Presence
     POST   /v1/sessions              Register agent (agent_id required)
+    POST   /v1/sessions/{id}/rename  Rename display_name mid-session
     DELETE /v1/sessions/{id}         Close session
     GET    /v1/agents                List live agents
+    GET    /v1/bootstrap             Session state + latest_visible_id
 
   Channels & Messages
     GET    /v1/channels              List channels
@@ -44,7 +46,10 @@ REST API — every endpoint at a glance:
 
   Admin
     GET    /v1/hub-info              Hub config and instance info
+    POST   /v1/network               Toggle remote access
+    GET    /v1/stream                SSE event stream
     POST   /v1/shutdown              Graceful shutdown (?delay_sec=60)
+    GET    /v1/shutdown              Shutdown status
     POST   /v1/shutdown/cancel       Cancel pending shutdown
     GET    /                         Live HTML dashboard
 
@@ -217,6 +222,9 @@ class HubStore:
     PRAGMA journal_mode=WAL;
     CREATE TABLE IF NOT EXISTS channels(name TEXT PRIMARY KEY,created_at TEXT NOT NULL,
         created_by TEXT,metadata_json TEXT NOT NULL DEFAULT '{}');
+    -- NOTE: PROTOCOL.md §3.5 caps message ids at 2^53-1 (9007199254740991)
+    -- for JSON-safe integer range. SQLite AUTOINCREMENT does not enforce this;
+    -- a conforming hub should guard create_message if exhaustion is a concern.
     CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT NOT NULL,
         from_agent TEXT NOT NULL,to_agent TEXT,channel TEXT NOT NULL,kind TEXT NOT NULL,
         body TEXT NOT NULL,attachments_json TEXT NOT NULL DEFAULT '[]',
@@ -390,6 +398,11 @@ class HubStore:
             r = self._db.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()
         return self._mg(r) if r else None
 
+    def update_message_metadata(self, msg_id, metadata):
+        with self._lk:
+            self._db.execute("UPDATE messages SET metadata_json=? WHERE id=?", (json.dumps(metadata or {}), msg_id))
+            self._db.commit()
+
     def list_channel_messages(self, ch, since_id=0, limit=100, *, tail=False):
         with self._lk:
             if tail and since_id <= 0:
@@ -494,7 +507,8 @@ class HubStore:
         with self._lk:
             ex = self._db.execute("SELECT * FROM claims WHERE claim_key=?", (claim_key,)).fetchone()
             if not ex or ex["owner_agent_id"] != agent_id: return None
-            if ex["released_at"] is not None: return self._cl(ex)
+            if ex["released_at"] is not None: return None
+            if ex["expires_at"] and ex["expires_at"] < _to_iso(_utcnow()): return None
             self._db.execute("UPDATE claims SET released_at=? WHERE claim_key=?", (_to_iso(_utcnow()), claim_key)); self._db.commit()
             return self._cl(self._db.execute("SELECT * FROM claims WHERE claim_key=?", (claim_key,)).fetchone())
 
@@ -690,7 +704,8 @@ class HubStore:
         with self._lk:
             ex = self._db.execute("SELECT * FROM locks WHERE file_path=?", (file_path,)).fetchone()
             if not ex or ex["agent_id"] != agent_id: return None
-            if ex["released_at"] is not None: return self._lk_row(ex)
+            if ex["released_at"] is not None: return None
+            if ex["expires_at"] and ex["expires_at"] < _to_iso(_utcnow()): return None
             self._db.execute("UPDATE locks SET released_at=? WHERE file_path=?", (_to_iso(_utcnow()), file_path)); self._db.commit()
             return self._lk_row(self._db.execute("SELECT * FROM locks WHERE file_path=?", (file_path,)).fetchone())
 
@@ -1176,6 +1191,7 @@ class _H(BaseHTTPRequestHandler):
                 if t and t["status"] == "open":
                     s.complete_task(orig["id"])
                     msg["metadata"]["task_completed"] = orig["id"]
+                    s.update_message_metadata(msg["id"], msg["metadata"])
         s.touch_agent_session(msg["from_agent"])
         return ({"ok":True,"result":msg}, 201)
     def _h_acquire_claim(self, p, m, q, b):

@@ -605,6 +605,7 @@ Query parameters:
 | `since_id` | Return rows with `id > since_id` |
 | `limit` | Maximum rows |
 | `timeout` | Optional long-poll wait in seconds |
+| `tail` | Boolean; when true and `since_id` is 0 or absent, return the last `limit` rows (most recent first, then re-sorted ascending). Useful for "show me the last N messages" without knowing the current high-water id. |
 
 Behavior:
 
@@ -675,6 +676,7 @@ Query parameters:
 |---|---|
 | `since_id` | Return rows with `id > since_id` |
 | `limit` | Maximum rows |
+| `tail` | Boolean; same semantics as `GET /v1/messages` `tail` parameter |
 
 Returns direct messages only.
 
@@ -906,15 +908,25 @@ Request body:
 { "delay_sec": 60 }
 ```
 
+`delay_sec` defaults to 60 if omitted.
+
 Behavior:
 
 - arms a shutdown timer
 - the reference implementation posts system notices when shutdown is initiated
   and when it fires
 
+Errors:
+
+- `400` if a shutdown is already pending
+
 #### `POST /v1/shutdown/cancel`
 
 Cancels a pending shutdown.
+
+Errors:
+
+- `400` if no shutdown is currently pending
 
 #### `POST /v1/network`
 

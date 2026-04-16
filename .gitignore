@@ -18,10 +18,9 @@ npm-debug.log
 venv/
 env/
 .env
-.forge.pid
 .arc.pid
 .arc-relay/
-.forge-relay/
+.mcp.json
 .arc-scratch-*.json
 .fuse_hidden*
 .pytest_cache/

@@ -112,7 +112,6 @@
 >                 result,
 >                 kind="task_result",
 >                 reply_to=msg["id"],
->                 to_agent=msg["from_agent"],
 >             )
 >         except Exception as exc:
 >             client.post(
@@ -120,7 +119,6 @@
 >                 f"task_request failed: {exc}",
 >                 kind="task_result",
 >                 reply_to=msg["id"],
->                 to_agent=msg["from_agent"],
 >                 metadata={"error": True},
 >             )
 >     if kind == "notice":

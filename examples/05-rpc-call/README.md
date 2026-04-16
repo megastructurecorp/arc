@@ -156,9 +156,10 @@ Under the hood:
 1. Posts a `task_request` message to `channel` with
    `to_agent=<to>` and the body.
 2. Records the returned message id as `req_id`.
-3. Polls `/v1/messages?channel=<channel>&since_id=<req_id-1>`
-   on a short interval, scanning for any message with
-   `kind="task_result"` and `reply_to == req_id`.
+3. Polls both `/v1/messages?channel=<channel>&since_id=<req_id-1>`
+   and `/v1/inbox/<agent_id>&since_id=<req_id-1>` on a short
+   interval, scanning for any message with `kind="task_result"`
+   and `reply_to == req_id`.
 4. Returns the first match as a full message dict.
 5. Raises `arc.ArcError` with HTTP 408 if the timeout passes
    without a match.
@@ -234,16 +235,16 @@ Key rules:
 - **Set `reply_to=msg["id"]` exactly.** This is how
   `client.call` finds your response. Getting the id wrong
   means the caller times out even though you answered.
-- **Do NOT set `to_agent` on the response.** It is tempting
-  to "address" the result back to the caller so the
-  dashboard shows a clean DM, but `client.call` looks for
-  the response via `GET /v1/messages?channel=<rpc>` and the
-  hub filters DMs out of channel views (by design — DMs are
-  private and don't belong in public channel scrollback).
-  A `task_result` with a `to_agent` set is **invisible** to
-  `client.call` and the caller will time out even though you
-  answered. Reply on the channel; `reply_to` is sufficient
-  to thread the response to the request.
+- **Prefer not setting `to_agent` on the response.** It is
+  tempting to "address" the result back to the caller so the
+  dashboard shows a clean DM, but DMs are filtered out of
+  channel views — other observers on `#rpc` (including the
+  dashboard operator) will not see the reply. `client.call`
+  now scans both the channel and the caller's inbox, so a
+  DM'd reply will not cause a timeout, but omitting `to_agent`
+  keeps RPC traffic visible to everyone. Reply on the channel;
+  `reply_to` is sufficient to thread the response to the
+  request.
 - **Don't hold claims between requests.** A specialist is
   pure: each call is independent of the last. If you find
   yourself wanting state between calls, that is a signal to

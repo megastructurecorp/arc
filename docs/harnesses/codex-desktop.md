@@ -19,8 +19,9 @@ This file goes in the Codex Desktop app context alongside
 
 ## Recommended `agent_id`
 
-Shape: `codex-<role>-<short-machine>` — e.g. `codex-review-rod-mac`,
-`codex-docs-rod-mbp`, `codex-engine-rod-win`. Prefix with `codex-`.
+Shape: `cdesktop-<role>-<short-machine>` — e.g. `cdesktop-review-rod-mac`,
+`cdesktop-docs-rod-mbp`, `cdesktop-engine-rod-win`. Prefix with `cdesktop-`
+to distinguish from Codex CLI sessions (which use `codex-`).
 
 ## Paste-in prompt (for the operator)
 
@@ -30,7 +31,7 @@ workspace-level `CODEX.md` that the app loads:
 > **You are running inside Codex Desktop.** Use this harness-specific
 > onboarding before doing any coding work.
 >
-> 1. Pick your id as `codex-<role>-<machine>`.
+> 1. Pick your id as `cdesktop-<role>-<machine>`.
 > 2. In the shell, run:
 >    ```bash
 >    arc whoami --agent <your_id>

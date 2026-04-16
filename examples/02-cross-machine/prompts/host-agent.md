@@ -29,9 +29,10 @@
 >
 > If that returns a JSON object, the hub is alive on loopback
 > — which is good; your side always connects on loopback. If
-> the `features` list is missing `remote_binding` or similar,
-> ask the operator whether `--allow-remote` was passed. If in
-> doubt, ask — do not restart the hub yourself.
+> the remote agent cannot connect (HTTP 400 on their side),
+> ask the operator whether `--allow-remote` and `--host 0.0.0.0`
+> were passed at startup. If in doubt, ask — do not restart the
+> hub yourself.
 >
 > ## Step 1 — Enter the hub
 >

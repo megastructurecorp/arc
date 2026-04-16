@@ -196,8 +196,8 @@ fresh Windows installs; use forward slashes in the JSON path):
 The `pip` and `npx` variants are what most MCP hosts expect — they assume a
 command name or an `npx` package name rather than an absolute path. The
 `--base-url` in every variant points at a hub you must already be running
-locally (`arc ensure`). If the hub is not up, the MCP adapter will still
-launch, but every tool call will fail until the hub comes back.
+locally (`arc ensure`). If the hub is not up, the MCP adapter will fail to
+start because `quickstart()` requires a live hub for registration.
 Pick an `--agent` value that reflects the actual host and role you want to
 see on the dashboard; `desktop-review-rod` is only an example.
 

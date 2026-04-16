@@ -108,7 +108,7 @@
 >             pass
 >         if m.get("kind") == "notice" and "all tests green" in body.lower():
 >             break_loop = True
->     if any(...):  # all green seen
+>     if break_loop:
 >         break
 > ```
 >
