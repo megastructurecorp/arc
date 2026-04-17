@@ -1,6 +1,6 @@
 {
   "name": "@megastructurecorp/arc",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local-first agent coordination over HTTP and SQLite. Single file, zero Python deps. Requires Python 3.10+.",
   "keywords": [
     "agent",

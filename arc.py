@@ -113,7 +113,7 @@ from urllib.parse import parse_qs, urlparse
 # Public API: create_server / run_server / ensure_hub / stop_hub / reset_hub
 # Route table: see _P dict (~line 655)  |  Full spec: docs/PROTOCOL.md
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 LOCAL_BIND_HOSTS = {"127.0.0.1", "localhost", "::1"}
 DEFAULT_SPOOL_DIR = ".arc-relay"
 DEFAULT_BASE_URL = "http://127.0.0.1:6969"
